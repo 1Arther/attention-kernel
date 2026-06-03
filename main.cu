@@ -93,6 +93,16 @@ void launch_attention_forward_tiled(
     int D
 );
 
+void launch_attention_forward_fused_row(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
 void attention_cpu_reference(
     const std::vector<float>& Q,
     const std::vector<float>& K,
@@ -102,6 +112,10 @@ void attention_cpu_reference(
     int S,
     int D
 );
+
+// ============================================================
+// configs / helpers
+// ============================================================
 
 struct AttnConfig {
     int B;
@@ -397,6 +411,67 @@ float benchmark_attention_total(
     return total_ms / static_cast<float>(repeat);
 }
 
+float benchmark_attention_fused_row(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D,
+    int warmup,
+    int repeat
+) {
+    for (int i = 0; i < warmup; ++i) {
+        launch_attention_forward_fused_row(
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D
+        );
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
+
+    for (int i = 0; i < repeat; ++i) {
+        launch_attention_forward_fused_row(
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D
+        );
+    }
+
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float total_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    return total_ms / static_cast<float>(repeat);
+}
+
 // ============================================================
 // run one config
 // ============================================================
@@ -481,7 +556,10 @@ void run_one_config(const AttnConfig& cfg) {
         cudaMemcpyHostToDevice
     ));
 
+    // ============================================================
     // correctness: naive total
+    // ============================================================
+
     launch_attention_forward(
         d_Q,
         d_K,
@@ -506,7 +584,10 @@ void run_one_config(const AttnConfig& cfg) {
 
     float naive_err = max_abs_error(h_ref, h_out);
 
+    // ============================================================
     // correctness: tiled total
+    // ============================================================
+
     launch_attention_forward_tiled(
         d_Q,
         d_K,
@@ -531,7 +612,36 @@ void run_one_config(const AttnConfig& cfg) {
 
     float tiled_err = max_abs_error(h_ref, h_out);
 
+    // ============================================================
+    // correctness: fused row
+    // ============================================================
+
+    launch_attention_forward_fused_row(
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CHECK_CUDA(cudaMemcpy(
+        h_out.data(),
+        d_O,
+        qkv_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+
+    float fused_err = max_abs_error(h_ref, h_out);
+
+    // ============================================================
     // stage-wise timing
+    // ============================================================
+
     float qk_naive_ms = benchmark_qk(
         false,
         d_Q,
@@ -649,9 +759,27 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
+    float total_fused_ms = benchmark_attention_fused_row(
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    // ============================================================
+    // stats
+    // ============================================================
+
     double qk_speedup = qk_naive_ms / qk_tiled_ms;
     double pv_speedup = pv_naive_ms / pv_tiled_ms;
-    double total_speedup = total_naive_ms / total_tiled_ms;
+    double tiled_speedup = total_naive_ms / total_tiled_ms;
+    double fused_vs_naive_speedup = total_naive_ms / total_fused_ms;
+    double fused_vs_tiled_speedup = total_tiled_ms / total_fused_ms;
 
     double score_mb = static_cast<double>(score_bytes) / 1024.0 / 1024.0;
     double qkv_mb = static_cast<double>(qkv_bytes) / 1024.0 / 1024.0;
@@ -675,13 +803,18 @@ void run_one_config(const AttnConfig& cfg) {
 
               << std::setw(16) << std::fixed << std::setprecision(4) << total_naive_ms
               << std::setw(16) << std::fixed << std::setprecision(4) << total_tiled_ms
-              << std::setw(14) << std::fixed << std::setprecision(3) << total_speedup
+              << std::setw(16) << std::fixed << std::setprecision(4) << total_fused_ms
+
+              << std::setw(14) << std::fixed << std::setprecision(3) << tiled_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << fused_vs_naive_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << fused_vs_tiled_speedup
 
               << std::setw(12) << std::fixed << std::setprecision(2) << score_mb
               << std::setw(12) << std::fixed << std::setprecision(2) << qkv_mb
 
               << std::setw(14) << std::scientific << std::setprecision(2) << naive_err
               << std::setw(14) << std::scientific << std::setprecision(2) << tiled_err
+              << std::setw(14) << std::scientific << std::setprecision(2) << fused_err
               << "\n";
 
     CHECK_CUDA(cudaFree(d_Q));
@@ -706,7 +839,7 @@ int main() {
     std::cout << "Device: " << prop.name << "\n";
     std::cout << "SM count: " << prop.multiProcessorCount << "\n\n";
 
-    std::cout << "=== Unfused Causal Attention Forward: Naive vs Tiled ===\n";
+    std::cout << "=== Causal Attention Forward: Naive vs Tiled vs Fused Row ===\n";
 
     std::cout << std::left
               << std::setw(6) << "B"
@@ -727,13 +860,18 @@ int main() {
 
               << std::setw(16) << "total_naive"
               << std::setw(16) << "total_tiled"
-              << std::setw(14) << "total_spd"
+              << std::setw(16) << "total_fused"
+
+              << std::setw(14) << "tiled_spd"
+              << std::setw(14) << "fused/naive"
+              << std::setw(14) << "fused/tiled"
 
               << std::setw(12) << "score_MB"
               << std::setw(12) << "qkv_MB"
 
               << std::setw(14) << "naive_err"
               << std::setw(14) << "tiled_err"
+              << std::setw(14) << "fused_err"
               << "\n";
 
     std::vector<AttnConfig> configs = {

@@ -242,6 +242,103 @@ __global__ void pv_matmul_tiled_kernel(
         O[idx]=sum;
    }
 }
+//一维
+__global__ void fused_causal_attention_row_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    int BH,
+    int S,
+    int D,
+    float scale
+) {
+    int tid=threadIdx.x;
+    int row=blockIdx.x;
+    if (row >= BH * S) return;
+    int q_pos=row%S;
+    int bh=row/S;
+
+    const float* q_ptr=Q+bh*S*D+q_pos*D;
+    const float* k_base=K+bh*S*D;
+    const float* v_base=V+bh*S*D;
+    float* o_ptr=O+bh*S*D+q_pos*D;
+
+    extern __shared__ float score_smem[];
+
+    float local_max=-FLT_MAX;
+    for(int k=tid;k<=q_pos;k+=blockDim.x){
+        const float* k_ptr=k_base+k*D;
+        float dot=0.0f;
+        for(int d=0;d<D;d++){
+            dot+=q_ptr[d]*k_ptr[d];
+        }
+
+        float score=dot*scale;
+
+        score_smem[k]=score;
+
+        local_max=fmaxf(score,local_max);
+    }
+    __syncthreads();
+
+    int warpNum=(blockDim.x+31)/32;
+
+    int warpId=tid/warpSize;
+    int laneId=tid%warpSize;
+    __shared__ float max_smem[32];
+    local_max=reduce_max(local_max);
+    if(laneId==0){
+        max_smem[warpId]=local_max;
+    }
+    __syncthreads();
+    if(warpId==0){
+        local_max=(laneId<warpNum)?max_smem[laneId]:-FLT_MAX;
+        local_max=reduce_max(local_max);
+    }
+    if(tid==0){
+        max_smem[0]=local_max;
+    }
+    __syncthreads();
+    local_max=max_smem[0];
+
+    float local_sum=0.0f;
+    for(int k=tid;k<=q_pos;k+=blockDim.x){
+        float e=score_smem[k];
+        e=expf(e-local_max);
+        local_sum+=e;
+        score_smem[k]=e;
+    }
+    local_sum=reduce_sum(local_sum);
+    __shared__ float sum_smem[32];
+    if(laneId==0){
+        sum_smem[warpId]=local_sum;
+    }
+    __syncthreads();
+    if(warpId==0){
+        local_sum=laneId<warpNum?sum_smem[laneId]:0.0f;
+        local_sum=reduce_sum(local_sum);
+    }
+    if(tid==0){
+        sum_smem[0]=local_sum;
+    }
+    __syncthreads();
+    local_sum=sum_smem[0];
+    float inv_sum=local_sum>0.0f?1/local_sum:0.0f;
+    for(int k=tid;k<=q_pos;k+=blockDim.x){
+        score_smem[k]=score_smem[k]*inv_sum;
+        //PV
+    }
+    __syncthreads();
+    //pv
+    for(int d=tid;d<D;d+=blockDim.x){
+        float acc=0.0f;
+        for(int k=0;k<=q_pos;k++){
+            acc+=(score_smem[k]*v_base[k*D+d]);
+        }
+        o_ptr[d]=acc;
+    }
+}
 
 void launch_qk_matmul(
     const float* d_Q,
@@ -544,5 +641,33 @@ void launch_attention_forward_tiled(
         BH,
         S,
         D
+    );
+}
+
+void launch_attention_forward_fused_row(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+) {
+    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    int block_size = 256;
+    dim3 grid(BH * S);
+
+    size_t smem = static_cast<size_t>(S) * sizeof(float);
+
+    fused_causal_attention_row_kernel<<<grid, block_size, smem>>>(
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        scale
     );
 }
