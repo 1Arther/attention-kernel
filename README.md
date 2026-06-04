@@ -1,30 +1,31 @@
-# CUDA Attention Kernel Lab
+# CUDA Causal Attention Kernel Lab
 
-本项目从零实现并测试了 **CUDA Causal Attention Forward** 的多个版本，重点覆盖：
+本项目从零实现并测试了多个 CUDA Causal Attention Forward 算子，用来理解 Attention 算子从 naive 实现、shared memory tiled 优化、fused row attention，再到 FlashAttention-style online softmax 的演进过程。
+
+当前已实现：
 
 - Naive QK^T
 - Scaled Causal Softmax
 - Naive P @ V
-- Shared-memory tiled QK^T
-- Shared-memory tiled P @ V
-- Naive vs Tiled stage-wise benchmark
-
-当前实现是 **unfused causal attention baseline**，不是 FlashAttention。它仍然显式保存 `scores` 和 `probs` 两个中间矩阵，用于验证 Attention forward 的正确性，并作为后续 fused attention / online softmax / FlashAttention-style 实现的基础。
+- Shared-memory Tiled QK^T
+- Shared-memory Tiled P @ V
+- Fused Row-wise Causal Attention
+- FlashAttention v1，基于 Online Softmax
 
 ---
 
-## 1. Tensor Layout
+## 1. 张量布局
 
-当前所有张量都使用 row-major layout：
+所有张量均采用 row-major 布局：
 
 ```text
 Q:      [BH, S, D]
 K:      [BH, S, D]
 V:      [BH, S, D]
+O:      [BH, S, D]
 
 scores: [BH, S, S]
 probs:  [BH, S, S]
-O:      [BH, S, D]
 
 其中：
 
@@ -34,285 +35,323 @@ H  = number of heads
 S  = sequence length
 D  = head dimension
 
-Attention forward 计算公式：
+Causal Attention Forward 的计算公式为：
 
-scores = Q @ K^T
-probs  = causal_softmax(scores / sqrt(D))
+scores = Q @ K^T / sqrt(D)
+probs  = causal_softmax(scores)
 O      = probs @ V
-2. 项目文件
-.
-├── attention_kernel.cu   # CUDA kernels, launchers, CPU reference
-├── main.cu               # correctness check and benchmark
-├── Makefile              # optional build script
-└── README.md
-3. 已实现 Kernel
-Kernel	说明
-qk_matmul_kernel	Naive QK^T，一个线程计算一个 scores[bh, q, k]
-qk_matmul_tiled_kernel	Shared-memory tiled QK^T，复用 Q/K tile
-scaled_causal_softmax_warp_kernel	Row-wise scaled causal softmax
-pv_matmul_kernel	Naive P @ V，一个线程计算一个 O[bh, q, d]
-pv_matmul_tiled_kernel	Shared-memory tiled P @ V，复用 probs/V tile
-launch_attention_forward	Naive unfused attention 总流程
-launch_attention_forward_tiled	Tiled unfused attention 总流程
-4. Naive Causal Attention
 
-Naive 总流程分为三步：
+代码中的一维地址访问方式为：
+
+Q[bh, q, d] = Q[bh * S * D + q * D + d]
+K[bh, k, d] = K[bh * S * D + k * D + d]
+V[bh, k, d] = V[bh * S * D + k * D + d]
+O[bh, q, d] = O[bh * S * D + q * D + d]
+2. 项目结构
+.
+├── attention_kernel.cu   # CUDA kernels、launcher、CPU reference
+├── main.cu               # 正确性测试和 benchmark
+├── Makefile              # 编译脚本
+└── README.md
+3. 已实现算子
+算子	说明
+qk_matmul_kernel	Naive QK^T，一个线程计算一个 score 元素
+qk_matmul_tiled_kernel	Shared-memory tiled QK^T
+scaled_causal_softmax_warp_kernel	行级 scaled causal softmax
+pv_matmul_kernel	Naive P @ V，一个线程计算一个输出元素
+pv_matmul_tiled_kernel	Shared-memory tiled P @ V
+fused_causal_attention_row_kernel	一个 block 计算一个 query row，不落地 global scores/probs
+flash_attention_v1_kernel	FlashAttention-style tiled attention，使用 online softmax
+4. Naive Unfused Attention
+
+Naive Attention 拆成三个阶段：
 
 1. scores = Q @ K^T
-2. probs = scaled_causal_softmax(scores)
-3. O = probs @ V
-4.1 Naive QK^T
+2. probs  = scaled_causal_softmax(scores)
+3. O      = probs @ V
 
-qk_matmul_kernel 中，一个线程负责一个 score：
+这个版本结构清晰，便于验证正确性，但性能较差。
+
+它会显式保存两个中间矩阵：
+
+scores: [BH, S, S]
+probs:  [BH, S, S]
+
+当序列长度 S 增大时，中间矩阵的显存占用和读写开销会快速增加。
+
+5. Shared-memory Tiled Unfused Attention
+
+Tiled 版本仍然保持三阶段流程：
+
+tiled QK -> causal softmax -> tiled PV
+
+但是 QK 和 PV 使用 shared memory tile 来减少 global memory 重复读取。
+
+5.1 Tiled QK
+
+QK 计算：
 
 scores[bh, q, k] = sum_d Q[bh, q, d] * K[bh, k, d]
 
-这种实现结构清晰，但没有数据复用。对于同一个 query 向量 Q[q, :]，它会被不同 key 重复读取；对于同一个 key 向量 K[k, :]，也会被不同 query 重复读取。
-
-4.2 Scaled Causal Softmax
-
-Causal softmax 用于 decoder self-attention，保证当前位置不能看未来 token：
-
-valid iff key_index <= query_index
-
-实现中将 scores 视为：
-
-scores: [BH * S, S]
-
-对于第 row 行：
-
-int q = row % query_len;
-bool valid = i <= q;
-
-softmax 计算时会跳过 future token，并将 future token 的输出置为 0。
-
-4.3 Naive P @ V
-
-pv_matmul_kernel 中，一个线程负责一个输出元素：
-
-O[bh, q, d] = sum_k probs[bh, q, k] * V[bh, k, d]
-
-这里的归约维度是 S，也就是 key/token 方向。
-
-5. Shared-memory Tiled QK^T
-
-tiled QK 使用一个 block 计算一个 scores tile：
-
-scores tile: [BLOCK_Q, BLOCK_K]
-
-当前设置：
+当前 tile 配置：
 
 BLOCK_Q = 16
 BLOCK_K = 16
 BLOCK_D = 16
 
-每个 block 内部加载：
+一个 CUDA block 计算一个 score tile：
+
+scores tile: [BLOCK_Q, BLOCK_K]
+
+shared memory 中保存：
 
 Q tile: [BLOCK_Q, BLOCK_D]
 K tile: [BLOCK_D, BLOCK_K]
 
-注意：global memory 中的 K 仍然是 [BH, S, D]，没有真正预转置。这里只是在 shared memory 中把 K tile 临时转成 [D, K]，使计算形式接近 GEMM：
+注意：global memory 中的 K 仍然是 [BH, S, D] 布局，并没有真正预转置。这里只是在 shared memory 中临时将 K tile 组织成 [D, K]，方便计算：
 
-scores_tile = Q_tile [Q, D] × K_tile^T [D, K]
+Q tile [Q, D] × K tile [D, K]
+5.2 Tiled PV
 
-核心计算：
+PV 计算：
 
-sum += q_smem[ty][d] * k_smem[d][tx];
+O[bh, q, d] = sum_k probs[bh, q, k] * V[bh, k, d]
 
-这对应：
-
-Q[bh, q_pos, d] * K[bh, k_pos, d]
-6. Shared-memory Tiled P @ V
-
-tiled PV 使用一个 block 计算一个 O tile：
-
-O tile: [BLOCK_P, BLOCK_V]
-
-当前设置：
+当前 tile 配置：
 
 BLOCK_P = 16
 BLOCK_V = 16
 BLOCK_S = 16
 
-每个 block 内部加载：
+shared memory 中保存：
 
 probs tile: [BLOCK_P, BLOCK_S]
 V tile:     [BLOCK_S, BLOCK_V]
 
-核心计算：
-
-sum += probs_smem[ty][k] * v_smem[k][tx];
-
-对应：
-
-O[bh, q, d] += probs[bh, q, k] * V[bh, k, d]
-
-注意：
+这里最容易混淆的是：
 
 QK 沿 D 维归约
 PV 沿 S 维归约
+6. Fused Row-wise Causal Attention
 
-这是实现 QK 和 PV 时最容易混淆的地方。
+Fused row 版本中，一个 CUDA block 负责一个 attention row：
 
-7. 编译与运行
+one block -> one (bh, q)
 
-A40 使用：
+也就是一个 block 处理一个 query。
+
+在一个 kernel 内部完成：
+
+1. score[k] = Q[q] · K[k] / sqrt(D)
+2. 对 k <= q 做 causal softmax
+3. O[q, d] = sum_k prob[k] * V[k, d]
+
+这个版本不再显式保存 global memory 中的：
+
+scores: [BH, S, S]
+probs:  [BH, S, S]
+
+但是它的缺点是跨 query 的 K/V 复用较差。每个 query row 都会重新读取 K/V，因此在大 S、多 head 场景下，不一定比 tiled unfused 版本更快。
+
+7. FlashAttention v1
+
+FlashAttention v1 是一个教学版 FlashAttention-style 实现，重点是验证：
+
+tiled QK + online softmax + tiled PV accumulation
+
+它不是工业级高性能版本，没有使用 Tensor Core / MMA，也没有做寄存器级 accumulator 优化。
+
+当前参数：
+
+BLOCK_M = 4
+BLOCK_N = 32
+MAX_D   = 128
+
+含义：
+
+BLOCK_M: 一个 block 处理多少个 query
+BLOCK_N: 每轮处理多少个 key/value
+MAX_D:   kernel 支持的最大 head dimension，用于静态 shared memory 分配
+
+一个 block 内部处理：
+
+Q tile:     [BLOCK_M, D]
+K tile:     [BLOCK_N, D]
+V tile:     [BLOCK_N, D]
+score tile: [BLOCK_M, BLOCK_N]
+acc tile:   [BLOCK_M, D]
+
+它不保存完整的：
+
+scores: [BH, S, S]
+probs:  [BH, S, S]
+
+而是循环遍历 K/V tile，并使用 online softmax 维护每个 query 的 running max、running sum 和 output accumulator。
+
+8. Online Softmax 原理
+
+普通 softmax 需要先看到完整一行 score：
+
+softmax(score[q, :])
+
+但 FlashAttention 是分块遍历 K/V，因此不能一次性得到完整 score row。
+
+所以对每个 query 维护：
+
+m   = 当前已经看过的 score 最大值
+l   = 当前 softmax 分母
+acc = 当前输出累加器
+
+每处理一个 K/V tile，先计算：
+
+score_tile = Q_tile @ K_tile^T / sqrt(D)
+
+然后更新：
+
+m_new = max(m_old, max(score_tile))
+
+l_new =
+    exp(m_old - m_new) * l_old
+    + sum(exp(score_tile - m_new))
+
+acc_new =
+    exp(m_old - m_new) * acc_old
+    + exp(score_tile - m_new) @ V_tile
+
+所有 K/V tile 处理完后：
+
+O = acc / l
+
+这就是 FlashAttention 的核心思想：只保存局部 tile，不保存完整 attention matrix，同时保持 softmax 数值稳定。
+
+9. 编译运行
+
+A40：
 
 nvcc -O3 -std=c++17 -arch=sm_86 main.cu attention_kernel.cu -o attention_bench
 ./attention_bench
 
-RTX 4090 / L40 等 Ada 架构 GPU 可以使用：
+RTX 4090 / Ada GPU：
 
 nvcc -O3 -std=c++17 -arch=sm_89 main.cu attention_kernel.cu -o attention_bench
 ./attention_bench
 
-如果使用 Makefile：
+为了避免编译失败后误运行旧二进制，建议：
 
-make
+rm -f attention_bench
+nvcc -O3 -std=c++17 -arch=sm_86 main.cu attention_kernel.cu -o attention_bench
 ./attention_bench
-8. Benchmark 配置
-
-测试配置：
-
-B = 1
-H = 1 / 8
-S = 64 / 128 / 256 / 512
-D = 64
+10. Benchmark 环境
 
 测试 GPU：
 
 NVIDIA A40
 SM count: 84
 
-Benchmark 输出包括：
+测试 shape：
 
-qk_naive
-qk_tiled
-qk_spd
+B = 1
+H = 1 / 8
+S = 64 / 128 / 256 / 512
+D = 64
+11. Benchmark 结果
+=== Causal Attention Forward: Naive vs Tiled vs Fused Row vs FlashAttention v1 ===
+B     H     BH      S       D       qk_naive      qk_tiled      qk_spd      softmax       pv_naive      pv_tiled      pv_spd      total_naive     total_tiled     total_fused     total_flash     tiled_spd     fused/naive   flash/naive   flash/tiled   flash/fused   score_MB    qkv_MB      naive_err     tiled_err     fused_err     flash_err
+1     1     1       64      64      0.0122        0.0038        3.240       0.0031        0.0043        0.0035        1.227       0.0195          0.0103          0.0075          0.0185          1.884         2.579         1.050         0.557         0.407         0.02        0.02        1.49e-07      1.49e-07      1.49e-07      1.49e-07
+1     1     1       128     64      0.0124        0.0039        3.210       0.0033        0.0066        0.0054        1.212       0.0222          0.0125          0.0123          0.0344          1.777         1.796         0.646         0.363         0.359         0.06        0.03        1.49e-07      1.49e-07      1.49e-07      1.79e-07
+1     8     8       128     64      0.0717        0.0104        6.927       0.0069        0.0122        0.0106        1.148       0.0909          0.0278          0.0505          0.0786          3.268         1.800         1.156         0.354         0.642         0.50        0.25        1.79e-07      1.79e-07      1.79e-07      1.86e-07
+1     8     8       256     64      0.2510        0.0312        8.053       0.0112        0.0369        0.0302        1.223       0.2994          0.0727          0.1600          0.2606          4.120         1.871         1.149         0.279         0.614         2.00        0.50        1.79e-07      1.79e-07      1.79e-07      1.86e-07
+1     8     8       512     64      0.9755        0.1150        8.480       0.0283        0.1353        0.1051        1.288       1.1379          0.2476          0.5641          0.9309          4.596         2.017         1.222         0.266         0.606         8.00        1.00        1.79e-07      1.79e-07      1.79e-07      1.94e-07
+12. 结果分析
+12.1 当前最快的是 tiled unfused attention
 
-softmax
+在 B=1,H=8,S=512,D=64 下：
 
-pv_naive
-pv_tiled
-pv_spd
+total_naive = 1.1379 ms
+total_tiled = 0.2476 ms
+speedup     = 4.596x
 
-total_naive
-total_tiled
-total_spd
-
-naive_err
-tiled_err
-
-其中：
-
-qk_spd    = qk_naive / qk_tiled
-pv_spd    = pv_naive / pv_tiled
-total_spd = total_naive / total_tiled
-9. Benchmark Results
-=== Unfused Causal Attention Forward: Naive vs Tiled ===
-B     H     BH      S       D       qk_naive      qk_tiled      qk_spd      softmax       pv_naive      pv_tiled      pv_spd      total_naive     total_tiled     total_spd     score_MB    qkv_MB      naive_err     tiled_err
-1     1     1       64      64      0.0123        0.0038        3.272       0.0031        0.0043        0.0036        1.216       0.0196          0.0103          1.901         0.02        0.02        1.49e-07      1.49e-07
-1     1     1       128     64      0.0124        0.0038        3.252       0.0033        0.0065        0.0054        1.210       0.0223          0.0125          1.783         0.06        0.03        1.49e-07      1.49e-07
-1     8     8       128     64      0.0722        0.0104        6.949       0.0069        0.0122        0.0106        1.150       0.0915          0.0279          3.280         0.50        0.25        1.79e-07      1.79e-07
-1     8     8       256     64      0.2532        0.0314        8.064       0.0113        0.0373        0.0304        1.228       0.2993          0.0726          4.120         2.00        0.50        1.79e-07      1.79e-07
-1     8     8       512     64      0.9755        0.1152        8.468       0.0283        0.1355        0.1052        1.288       1.1381          0.2479          4.590         8.00        1.00        1.79e-07      1.79e-07
-10. 结果分析
-10.1 Tiled QK 是主要优化来源
-
-对于较大序列长度，QK 是 naive attention 的主要瓶颈。
-
-在 B=1, H=8, S=512, D=64 下：
+主要收益来自 tiled QK：
 
 qk_naive = 0.9755 ms
-qk_tiled = 0.1152 ms
-speedup  = 8.468x
+qk_tiled = 0.1150 ms
+speedup  = 8.480x
 
-说明 shared memory tile 有效减少了 Q/K 的重复 global memory 读取。
+说明 shared memory tile 对 Q/K 数据复用非常有效。
 
-10.2 Tiled PV 也有收益，但没有 QK 明显
+12.2 fused row attention 正确，但大 S 下慢于 tiled
 
-在 B=1, H=8, S=512, D=64 下：
+在 B=1,H=8,S=512,D=64 下：
 
-pv_naive = 0.1355 ms
-pv_tiled = 0.1052 ms
-speedup  = 1.288x
+total_fused = 0.5641 ms
+fused_err   = 1.79e-07
 
-PV 的提升较小，因为当前 naive PV 相比 naive QK 原本耗时就更低，并且输出维度是 [BH, S, D]，不像 QK 需要生成 [BH, S, S] 的 score matrix。
+fused row 版本不保存 global scores/probs，正确性通过。
 
-10.3 总体 Attention 加速明显
+但由于一个 block 只处理一个 query row，K/V 跨 query 复用不足，因此在大 S 下比 tiled unfused 慢。
 
-在 B=1, H=8, S=512, D=64 下：
+12.3 FlashAttention v1 正确实现了 online softmax
 
-total_naive = 1.1381 ms
-total_tiled = 0.2479 ms
-speedup     = 4.590x
+在 B=1,H=8,S=512,D=64 下：
 
-同时：
+total_flash = 0.9309 ms
+flash_err   = 1.94e-07
 
-naive_err = 1.79e-07
-tiled_err = 1.79e-07
+flash_err 在 1e-7 量级，说明 online softmax 更新逻辑是正确的。
 
-说明 tiled 版本在保持数值正确性的前提下显著提升了性能。
+但是该版本是教学版，性能还没有超过 tiled unfused。主要原因：
 
-11. 当前实现的局限
+1. QK 使用普通 FP32 for-loop，没有使用 Tensor Core / MMA。
+2. online softmax 的 max/sum 更新部分比较串行。
+3. acc_smem 放在 shared memory 中，没有寄存器化。
+4. BLOCK_M / BLOCK_N 比较保守。
+5. 没有使用 float4 向量化加载。
+6. 没有做 warp-level 高效 softmax 优化。
+13. 版本对比
+版本	是否保存 scores/probs	是否使用 shared memory	是否使用 online softmax	当前性能
+Naive unfused	是	否	否	最慢
+Tiled unfused	是	是	否	当前最快
+Fused row	否	是	否	正确，中等速度
+FlashAttention v1	否	是	是	正确，教学版
+14. 项目展示了什么
 
-当前版本仍然是 unfused attention：
+本项目展示了 causal attention kernel 的完整演进路线：
 
-QK^T -> causal softmax -> P @ V
+naive attention
+-> shared-memory tiled attention
+-> fused row attention
+-> FlashAttention-style online softmax
 
-它仍然显式保存：
+当前 FlashAttention v1 已经验证了 FlashAttention 的核心算法：
 
-scores: [BH, S, S]
-probs:  [BH, S, S]
+tile-based QK
+online softmax
+tile-based PV accumulation
+no global scores/probs materialization
 
-因此随着 S 增大，中间矩阵的显存开销会快速增长：
+虽然还不是高性能工业实现，但已经完整体现了 FlashAttention 的关键思想。
 
-scores memory = BH * S * S * sizeof(float)
-probs memory  = BH * S * S * sizeof(float)
+15. 后续优化方向
 
-例如：
+后续可以继续做：
 
-B=1, H=8, S=512
-scores = 8 MB
-probs  = 8 MB
+1. Causal tile skipping
+   如果当前 K/V tile 全部在未来位置，直接跳过。
 
-这也是 FlashAttention 要解决的核心问题之一。
+2. 调整 tile 参数
+   测试 BLOCK_M=8, BLOCK_N=32
+   测试 BLOCK_M=8, BLOCK_N=64
 
-12. 面试讲法
+3. 减少 shared memory 使用
+   尝试去掉 score_smem，边算边更新局部统计量。
 
-可以这样介绍：
+4. accumulator 寄存器化
+   减少 acc_smem 的 shared memory 读写。
 
-我实现了一个 CUDA causal attention forward benchmark，首先实现了 unfused baseline，
-将 attention 拆成 QK^T、scaled causal softmax 和 P@V 三个阶段。
+5. float4 向量化加载
+   当 D % 4 == 0 时使用 float4 load/store。
 
-在 naive 版本中，一个线程计算一个 score 或一个 output 元素，结构清晰但缺少数据复用。
-随后我实现了 shared-memory tiled QK 和 tiled PV。
+6. Tensor Core / WMMA 版本
+   用 MMA 加速 QK 和 P@V tile 计算。
 
-对于 QK，一个 block 计算 16x16 的 scores tile，并沿 D 维分块加载 Q/K。
-其中 K 在 global memory 中仍然是 [BH, S, D]，但在 shared memory 中临时转成 [D, K]，
-这样计算形式接近 GEMM：Q_tile [Q,D] × K_tile^T [D,K]。
-
-对于 PV，一个 block 计算 16x16 的 O tile，并沿 S 维分块加载 probs/V。
-实验显示，在 B=1,H=8,S=512,D=64 时，QK 从 0.9755 ms 降到 0.1152 ms，
-提升 8.47x；整体 attention 从 1.1381 ms 降到 0.2479 ms，提升 4.59x。
-同时 max error 保持在 1e-7 量级，说明 tiled 版本和 CPU reference 对齐。
-
-当前版本仍然显式保存 scores 和 probs，下一步可以继续实现 fused attention 和 online softmax，
-逐步过渡到 FlashAttention 的思想。
-13. 后续方向
-
-后续可以继续实现：
-
-1. Fused row-wise causal attention
-   - 不保存 probs
-   - 一个 block 处理一个 query row
-
-2. Online softmax attention
-   - 分块遍历 K/V
-   - 维护 running max 和 running sum
-
-3. Simplified FlashAttention
-   - tile Q/K/V
-   - 在 tile 内完成 score、online softmax 和 O 累加
-   - 避免显式落地完整 scores/probs
-
+7. 和 PyTorch / cuDNN / FlashAttention 官方库做对比。
