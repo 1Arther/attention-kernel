@@ -1,5 +1,5 @@
 #include <cuda_runtime.h>
-
+#include <cstdio>
 #include <algorithm>
 #include <cmath>
 #include <cfloat>
@@ -242,11 +242,12 @@ __global__ void pv_matmul_tiled_kernel(
         O[idx]=sum;
    }
 }
-//一维
+
+//一维[BH,S,D] -> [BH*S,D]
 __global__ void fused_causal_attention_row_kernel(
-    const float* __restrict__ Q,
-    const float* __restrict__ K,
-    const float* __restrict__ V,
+    const float* __restrict__ Q,  //query
+    const float* __restrict__ K,  //key
+    const float* __restrict__ V,  //value
     float* __restrict__ O,
     int BH,
     int S,
@@ -259,16 +260,18 @@ __global__ void fused_causal_attention_row_kernel(
     int q_pos=row%S;
     int bh=row/S;
 
-    const float* q_ptr=Q+bh*S*D+q_pos*D;
-    const float* k_base=K+bh*S*D;
-    const float* v_base=V+bh*S*D;
-    float* o_ptr=O+bh*S*D+q_pos*D;
+    //全是[BH,S,D]
+    const float* q_ptr=Q+bh*S*D+q_pos*D;  //Q的某一行起点
+    const float* k_base=K+bh*S*D;   //K的某一个bh矩阵起点
+    const float* v_base=V+bh*S*D;   //V的某一个bh矩阵起点
+    float* o_ptr=O+bh*S*D+q_pos*D;  //O的某一行起点
 
     extern __shared__ float score_smem[];
 
     float local_max=-FLT_MAX;
-    for(int k=tid;k<=q_pos;k+=blockDim.x){
-        const float* k_ptr=k_base+k*D;
+    //QKT [BH,S,D]*[BH,S,D]T=[BH,S,S]
+    for(int k=tid;k<=q_pos;k+=blockDim.x){  //一个block负责一行，一个thread负责若干个元素
+        const float* k_ptr=k_base+k*D;//k的某一行起点
         float dot=0.0f;
         for(int d=0;d<D;d++){
             dot+=q_ptr[d]*k_ptr[d];
@@ -327,10 +330,9 @@ __global__ void fused_causal_attention_row_kernel(
     float inv_sum=local_sum>0.0f?1/local_sum:0.0f;
     for(int k=tid;k<=q_pos;k+=blockDim.x){
         score_smem[k]=score_smem[k]*inv_sum;
-        //PV
     }
     __syncthreads();
-    //pv
+    //pv [BH,S,S]*[BH,S,D]->[BH,S,D]
     for(int d=tid;d<D;d+=blockDim.x){
         float acc=0.0f;
         for(int k=0;k<=q_pos;k++){
@@ -339,6 +341,246 @@ __global__ void fused_causal_attention_row_kernel(
         o_ptr[d]=acc;
     }
 }
+
+//二维grid一维block
+//一个BLOCK负责BLOCK_M个query，每轮处理BLOCK_N个key和value
+template<int BLOCK_M, int BLOCK_N, int MAX_D>
+__global__ void flash_attention_v1_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ O,
+    int BH,
+    int S,
+    int D,
+    float scale
+) {
+    int tid = threadIdx.x;
+
+    int q_block = blockIdx.x;
+    int bh = blockIdx.y;
+
+    int q_start = q_block * BLOCK_M;
+
+    //行起始
+    const float* q_base = Q + bh * S * D;
+    const float* k_base = K + bh * S * D;
+    const float* v_base = V + bh * S * D;
+    float* o_base = O + bh * S * D;
+
+    __shared__ float q_smem[BLOCK_M][MAX_D];
+    __shared__ float k_smem[BLOCK_N][MAX_D];
+    __shared__ float v_smem[BLOCK_N][MAX_D];
+
+    __shared__ float score_smem[BLOCK_M][BLOCK_N];
+
+    __shared__ float acc_smem[BLOCK_M][MAX_D];
+
+    __shared__ float m_smem[BLOCK_M];
+    __shared__ float l_smem[BLOCK_M];//softmax分母
+
+    __shared__ float m_new_smem[BLOCK_M];
+    __shared__ float l_new_smem[BLOCK_M];
+
+    // ============================================================
+    // 1. Load Q tile and initialize acc/m/l
+    // ============================================================
+
+    for (int idx = tid; idx < BLOCK_M * D; idx += blockDim.x) {
+        int qi = idx / D;
+        int d = idx % D;
+
+        int q = q_start + qi;
+
+        if (q < S) {
+            q_smem[qi][d] = q_base[q * D + d];
+        } else {
+            q_smem[qi][d] = 0.0f;
+        }
+
+        acc_smem[qi][d] = 0.0f;
+    }
+
+    if (tid < BLOCK_M) {
+        m_smem[tid] = -FLT_MAX;
+        l_smem[tid] = 0.0f;
+        m_new_smem[tid] = -FLT_MAX;
+        l_new_smem[tid] = 0.0f;
+    }
+
+    __syncthreads();
+
+    // ============================================================
+    // 2. Loop over K/V tiles
+    // ============================================================
+
+    for (int k_start = 0; k_start < S; k_start += BLOCK_N) {
+        // ------------------------------------------------------------
+        // Load K/V tile: [BLOCK_N, D]
+        // ------------------------------------------------------------
+
+        for (int idx = tid; idx < BLOCK_N * D; idx += blockDim.x) {
+            int kj = idx / D;
+            int d = idx % D;
+
+            int k = k_start + kj;
+
+            if (k < S) {
+                k_smem[kj][d] = k_base[k * D + d];
+                v_smem[kj][d] = v_base[k * D + d];
+            } else {
+                k_smem[kj][d] = 0.0f;
+                v_smem[kj][d] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // ------------------------------------------------------------
+        // Compute score tile: [BLOCK_M, BLOCK_N]
+        //
+        // score[qi, kj] = Q[q] · K[k] * scale
+        // causal valid iff k <= q
+        // ------------------------------------------------------------
+
+        for (int idx = tid; idx < BLOCK_M * BLOCK_N; idx += blockDim.x) {
+            int qi = idx / BLOCK_N;
+            int kj = idx % BLOCK_N;
+
+            //仅仅用来判断是否越界
+            int q = q_start + qi;
+            int k = k_start + kj;
+
+            float score = -FLT_MAX;
+
+            if (q < S && k < S && k <= q) {
+                float dot = 0.0f;
+
+                for (int d = 0; d < D; ++d) {
+                    dot += q_smem[qi][d] * k_smem[kj][d];
+                }
+
+                score = dot * scale;
+            }
+
+            score_smem[qi][kj] = score;
+        }
+
+        __syncthreads();
+
+        // ------------------------------------------------------------
+        // Online softmax update: compute m_new and l_new
+        //
+        // m_new = max(m_old, max(score_tile))
+        // l_new = exp(m_old - m_new) * l_old
+        //       + sum(exp(score_tile - m_new))
+        // ------------------------------------------------------------
+
+        if (tid < BLOCK_M) {
+            int qi = tid;
+            int q = q_start + qi;
+
+            float m_old = m_smem[qi];
+            float l_old = l_smem[qi];
+
+            float tile_max = -FLT_MAX;
+
+            if (q < S) {
+                for (int kj = 0; kj < BLOCK_N; ++kj) {
+                    tile_max = fmaxf(tile_max, score_smem[qi][kj]);
+                }
+            }
+
+            float m_new = fmaxf(m_old, tile_max);
+
+            float alpha = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
+
+            float tile_sum = 0.0f;
+
+            if (q < S) {//这一批已经得到最大值，就不需要缩放
+                for (int kj = 0; kj < BLOCK_N; ++kj) {
+                    float s = score_smem[qi][kj];
+
+                    // invalid score is -FLT_MAX, contribution ~= 0
+                    tile_sum += expf(s - m_new);
+                }
+            }
+
+            float l_new = alpha * l_old + tile_sum;
+
+            m_new_smem[qi] = m_new;
+            l_new_smem[qi] = l_new;
+        }
+
+        __syncthreads();
+
+        // ------------------------------------------------------------
+        // Update acc:
+        //
+        // acc_new =
+        //     exp(m_old - m_new) * acc_old
+        //   + exp(score_tile - m_new) @ V_tile
+        // ------------------------------------------------------------
+
+        for (int idx = tid; idx < BLOCK_M * D; idx += blockDim.x) {
+            int qi = idx / D;
+            int d = idx % D;
+
+            int q = q_start + qi;
+
+            if (q < S) {
+                float m_old = m_smem[qi];
+                float m_new = m_new_smem[qi];
+
+                float alpha = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
+
+                float acc = acc_smem[qi][d] * alpha;//缩放QKT
+
+                for (int kj = 0; kj < BLOCK_N; ++kj) {  //中间维度
+                    float s = score_smem[qi][kj];
+                    float p = expf(s - m_new);
+
+                    acc += p * v_smem[kj][d];
+                }
+
+                acc_smem[qi][d] = acc;
+            }
+        }
+
+        __syncthreads();
+
+        // ------------------------------------------------------------
+        // Commit m/l for next K/V tile
+        // ------------------------------------------------------------
+
+        if (tid < BLOCK_M) {
+            m_smem[tid] = m_new_smem[tid];
+            l_smem[tid] = l_new_smem[tid];
+        }
+
+        __syncthreads();
+    }
+
+    // ============================================================
+    // 3. Write output: O = acc / l
+    // ============================================================
+
+    for (int idx = tid; idx < BLOCK_M * D; idx += blockDim.x) {
+        int qi = idx / D;
+        int d = idx % D;
+
+        int q = q_start + qi;
+
+        if (q < S) {
+            float denom = l_smem[qi];
+
+            float out = denom > 0.0f ? acc_smem[qi][d] / denom : 0.0f;
+
+            o_base[q * D + d] = out;
+        }
+    }
+}
+
 
 void launch_qk_matmul(
     const float* d_Q,
@@ -670,4 +912,44 @@ void launch_attention_forward_fused_row(
         D,
         scale
     );
+}
+
+void launch_flash_attention_v1(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+) {
+    constexpr int BLOCK_M = 4;
+    constexpr int BLOCK_N = 32;
+    constexpr int MAX_D = 128;
+
+    if (D > MAX_D) {
+        fprintf(stderr, "flash_attention_v1 only supports D <= %d, got D = %d\n", MAX_D, D);
+        return;
+    }
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    dim3 grid(
+        (S + BLOCK_M - 1) / BLOCK_M,
+        BH
+    );
+
+    dim3 block(128);
+
+    flash_attention_v1_kernel<BLOCK_M, BLOCK_N, MAX_D>
+        <<<grid, block>>>(
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D,
+            scale
+        );
 }
