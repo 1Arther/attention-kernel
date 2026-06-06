@@ -338,3 +338,30 @@ naive attention
 
 我还测试了 BM4、BM8、BM16 三种 query tile size，发现短序列下 BM4 更稳，S=256 时 BM8 略优，S=512 时 BM16 最优，因此实现了基于序列长度的 dispatch。
 
+## Register Accumulator Optimization
+
+在 FlashAttention tile-skipping 版本基础上，进一步实现了 register accumulator 版本，将原先存放在 shared memory 中的 `acc_smem[BLOCK_M][MAX_D]` 改为每个线程私有的寄存器累加变量，以减少跨 K/V tile 更新时的 shared memory 读写。
+
+实验结果表明，register accumulator 并不是所有 shape 都更快。对于短序列，BM4 regacc 由于寄存器压力和额外指令开销，反而慢于 BM4 smem；但对于较长序列，尤其是 `S=512,D=64`，BM16 regacc 能有效减少 repeated shared-memory traffic。
+
+在 `B=1,H=8,S=512,D=64` 下：
+
+```text
+FlashAttention v1       = 0.9307 ms
+Tile skipping dispatch  = 0.5206 ms
+BM16 smem               = 0.5799 ms
+BM16 regacc             = 0.5183 ms
+
+相较原始 FlashAttention v1，最终 dispatch 版本达到约 1.79x 加速；相较 BM16 smem，BM16 regacc 达到约 1.12x 加速。所有版本误差均保持在 1e-7 量级。
+
+最终采用 hybrid dispatch：
+
+if (S >= 512 && D <= 64) {
+    use BM16 regacc;
+} else if (S >= 256) {
+    use BM8 regacc;
+} else {
+    use BM4 smem;
+}
+
+该策略避免了小序列下 regacc 变慢的问题，同时保留长序列下 register accumulator 的收益。

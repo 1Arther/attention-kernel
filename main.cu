@@ -113,6 +113,7 @@ void launch_flash_attention_v1(
     int D
 );
 
+// 默认 dispatch，可以选择 smem 或 regacc，取决于你 attention_kernel.cu 里怎么写
 void launch_flash_attention_causal_tile_skipping(
     const float* d_Q,
     const float* d_K,
@@ -123,7 +124,8 @@ void launch_flash_attention_causal_tile_skipping(
     int D
 );
 
-void launch_flash_attention_skip_bm4(
+// 旧版：shared-memory accumulator
+void launch_flash_attention_skip_bm4_smem(
     const float* d_Q,
     const float* d_K,
     const float* d_V,
@@ -133,7 +135,7 @@ void launch_flash_attention_skip_bm4(
     int D
 );
 
-void launch_flash_attention_skip_bm8(
+void launch_flash_attention_skip_bm8_smem(
     const float* d_Q,
     const float* d_K,
     const float* d_V,
@@ -143,7 +145,38 @@ void launch_flash_attention_skip_bm8(
     int D
 );
 
-void launch_flash_attention_skip_bm16(
+void launch_flash_attention_skip_bm16_smem(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+// 新版：register accumulator
+void launch_flash_attention_skip_bm4_regacc(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+void launch_flash_attention_skip_bm8_regacc(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+void launch_flash_attention_skip_bm16_regacc(
     const float* d_Q,
     const float* d_K,
     const float* d_V,
@@ -176,7 +209,7 @@ struct AttnConfig {
     int repeat;
 };
 
-using FlashLauncher = void (*)(
+using AttentionLauncher = void (*)(
     const float*,
     const float*,
     const float*,
@@ -199,8 +232,8 @@ float max_abs_error(
     return err;
 }
 
-float check_flash_launcher_correctness(
-    FlashLauncher launcher,
+float check_attention_launcher_correctness(
+    AttentionLauncher launcher,
     const std::vector<float>& h_ref,
     std::vector<float>& h_out,
     const float* d_Q,
@@ -507,8 +540,8 @@ float benchmark_attention_total(
     return total_ms / static_cast<float>(repeat);
 }
 
-float benchmark_flash_launcher(
-    FlashLauncher launcher,
+float benchmark_attention_launcher(
+    AttentionLauncher launcher,
     const float* d_Q,
     const float* d_K,
     const float* d_V,
@@ -632,29 +665,12 @@ void run_one_config(const AttnConfig& cfg) {
     CHECK_CUDA(cudaMalloc(&d_probs, score_bytes));
     CHECK_CUDA(cudaMalloc(&d_O, qkv_bytes));
 
-    CHECK_CUDA(cudaMemcpy(
-        d_Q,
-        h_Q.data(),
-        qkv_bytes,
-        cudaMemcpyHostToDevice
-    ));
-
-    CHECK_CUDA(cudaMemcpy(
-        d_K,
-        h_K.data(),
-        qkv_bytes,
-        cudaMemcpyHostToDevice
-    ));
-
-    CHECK_CUDA(cudaMemcpy(
-        d_V,
-        h_V.data(),
-        qkv_bytes,
-        cudaMemcpyHostToDevice
-    ));
+    CHECK_CUDA(cudaMemcpy(d_Q, h_Q.data(), qkv_bytes, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_K, h_K.data(), qkv_bytes, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_V, h_V.data(), qkv_bytes, cudaMemcpyHostToDevice));
 
     // ============================================================
-    // correctness
+    // correctness: naive / tiled
     // ============================================================
 
     launch_attention_forward(
@@ -671,13 +687,7 @@ void run_one_config(const AttnConfig& cfg) {
 
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
-
-    CHECK_CUDA(cudaMemcpy(
-        h_out.data(),
-        d_O,
-        qkv_bytes,
-        cudaMemcpyDeviceToHost
-    ));
+    CHECK_CUDA(cudaMemcpy(h_out.data(), d_O, qkv_bytes, cudaMemcpyDeviceToHost));
 
     float naive_err = max_abs_error(h_ref, h_out);
 
@@ -695,17 +705,15 @@ void run_one_config(const AttnConfig& cfg) {
 
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
-
-    CHECK_CUDA(cudaMemcpy(
-        h_out.data(),
-        d_O,
-        qkv_bytes,
-        cudaMemcpyDeviceToHost
-    ));
+    CHECK_CUDA(cudaMemcpy(h_out.data(), d_O, qkv_bytes, cudaMemcpyDeviceToHost));
 
     float tiled_err = max_abs_error(h_ref, h_out);
 
-    float fused_err = check_flash_launcher_correctness(
+    // ============================================================
+    // correctness: fused / flash / default skip dispatch
+    // ============================================================
+
+    float fused_err = check_attention_launcher_correctness(
         launch_attention_forward_fused_row,
         h_ref,
         h_out,
@@ -719,7 +727,7 @@ void run_one_config(const AttnConfig& cfg) {
         D
     );
 
-    float flash_err = check_flash_launcher_correctness(
+    float flash_err = check_attention_launcher_correctness(
         launch_flash_attention_v1,
         h_ref,
         h_out,
@@ -733,7 +741,7 @@ void run_one_config(const AttnConfig& cfg) {
         D
     );
 
-    float skip_err = check_flash_launcher_correctness(
+    float skip_err = check_attention_launcher_correctness(
         launch_flash_attention_causal_tile_skipping,
         h_ref,
         h_out,
@@ -747,8 +755,12 @@ void run_one_config(const AttnConfig& cfg) {
         D
     );
 
-    float bm4_err = check_flash_launcher_correctness(
-        launch_flash_attention_skip_bm4,
+    // ============================================================
+    // correctness: smem accumulator
+    // ============================================================
+
+    float bm4_smem_err = check_attention_launcher_correctness(
+        launch_flash_attention_skip_bm4_smem,
         h_ref,
         h_out,
         d_Q,
@@ -761,8 +773,8 @@ void run_one_config(const AttnConfig& cfg) {
         D
     );
 
-    float bm8_err = check_flash_launcher_correctness(
-        launch_flash_attention_skip_bm8,
+    float bm8_smem_err = check_attention_launcher_correctness(
+        launch_flash_attention_skip_bm8_smem,
         h_ref,
         h_out,
         d_Q,
@@ -775,8 +787,54 @@ void run_one_config(const AttnConfig& cfg) {
         D
     );
 
-    float bm16_err = check_flash_launcher_correctness(
-        launch_flash_attention_skip_bm16,
+    float bm16_smem_err = check_attention_launcher_correctness(
+        launch_flash_attention_skip_bm16_smem,
+        h_ref,
+        h_out,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        qkv_bytes,
+        BH,
+        S,
+        D
+    );
+
+    // ============================================================
+    // correctness: register accumulator
+    // ============================================================
+
+    float bm4_reg_err = check_attention_launcher_correctness(
+        launch_flash_attention_skip_bm4_regacc,
+        h_ref,
+        h_out,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        qkv_bytes,
+        BH,
+        S,
+        D
+    );
+
+    float bm8_reg_err = check_attention_launcher_correctness(
+        launch_flash_attention_skip_bm8_regacc,
+        h_ref,
+        h_out,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        qkv_bytes,
+        BH,
+        S,
+        D
+    );
+
+    float bm16_reg_err = check_attention_launcher_correctness(
+        launch_flash_attention_skip_bm16_regacc,
         h_ref,
         h_out,
         d_Q,
@@ -878,6 +936,10 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
+    // ============================================================
+    // total timing
+    // ============================================================
+
     float total_naive_ms = benchmark_attention_total(
         false,
         d_Q,
@@ -908,7 +970,7 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    float total_fused_ms = benchmark_flash_launcher(
+    float total_fused_ms = benchmark_attention_launcher(
         launch_attention_forward_fused_row,
         d_Q,
         d_K,
@@ -921,7 +983,7 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    float total_flash_ms = benchmark_flash_launcher(
+    float total_flash_ms = benchmark_attention_launcher(
         launch_flash_attention_v1,
         d_Q,
         d_K,
@@ -934,7 +996,7 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    float total_skip_ms = benchmark_flash_launcher(
+    float total_skip_ms = benchmark_attention_launcher(
         launch_flash_attention_causal_tile_skipping,
         d_Q,
         d_K,
@@ -947,8 +1009,8 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    float total_bm4_ms = benchmark_flash_launcher(
-        launch_flash_attention_skip_bm4,
+    float bm4_smem_ms = benchmark_attention_launcher(
+        launch_flash_attention_skip_bm4_smem,
         d_Q,
         d_K,
         d_V,
@@ -960,8 +1022,8 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    float total_bm8_ms = benchmark_flash_launcher(
-        launch_flash_attention_skip_bm8,
+    float bm8_smem_ms = benchmark_attention_launcher(
+        launch_flash_attention_skip_bm8_smem,
         d_Q,
         d_K,
         d_V,
@@ -973,8 +1035,47 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    float total_bm16_ms = benchmark_flash_launcher(
-        launch_flash_attention_skip_bm16,
+    float bm16_smem_ms = benchmark_attention_launcher(
+        launch_flash_attention_skip_bm16_smem,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    float bm4_reg_ms = benchmark_attention_launcher(
+        launch_flash_attention_skip_bm4_regacc,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    float bm8_reg_ms = benchmark_attention_launcher(
+        launch_flash_attention_skip_bm8_regacc,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    float bm16_reg_ms = benchmark_attention_launcher(
+        launch_flash_attention_skip_bm16_regacc,
         d_Q,
         d_K,
         d_V,
@@ -994,17 +1095,18 @@ void run_one_config(const AttnConfig& cfg) {
     double pv_speedup = pv_naive_ms / pv_tiled_ms;
 
     double tiled_speedup = total_naive_ms / total_tiled_ms;
-    double fused_vs_naive_speedup = total_naive_ms / total_fused_ms;
-    double flash_vs_naive_speedup = total_naive_ms / total_flash_ms;
-    double skip_vs_naive_speedup = total_naive_ms / total_skip_ms;
+    double fused_vs_naive = total_naive_ms / total_fused_ms;
+    double flash_vs_naive = total_naive_ms / total_flash_ms;
+    double skip_vs_naive = total_naive_ms / total_skip_ms;
 
-    double flash_vs_tiled_speedup = total_tiled_ms / total_flash_ms;
-    double skip_vs_tiled_speedup = total_tiled_ms / total_skip_ms;
-    double skip_vs_flash_speedup = total_flash_ms / total_skip_ms;
+    double flash_vs_tiled = total_tiled_ms / total_flash_ms;
+    double skip_vs_tiled = total_tiled_ms / total_skip_ms;
+    double skip_vs_flash = total_flash_ms / total_skip_ms;
 
-    double bm4_vs_flash_speedup = total_flash_ms / total_bm4_ms;
-    double bm8_vs_flash_speedup = total_flash_ms / total_bm8_ms;
-    double bm16_vs_flash_speedup = total_flash_ms / total_bm16_ms;
+    // > 1.0 表示 regacc 比 smem 快
+    double reg4_vs_smem = bm4_smem_ms / bm4_reg_ms;
+    double reg8_vs_smem = bm8_smem_ms / bm8_reg_ms;
+    double reg16_vs_smem = bm16_smem_ms / bm16_reg_ms;
 
     double score_mb = static_cast<double>(score_bytes) / 1024.0 / 1024.0;
     double qkv_mb = static_cast<double>(qkv_bytes) / 1024.0 / 1024.0;
@@ -1031,22 +1133,27 @@ void run_one_config(const AttnConfig& cfg) {
               << std::setw(16) << std::fixed << std::setprecision(4) << total_fused_ms
               << std::setw(16) << std::fixed << std::setprecision(4) << total_flash_ms
               << std::setw(16) << std::fixed << std::setprecision(4) << total_skip_ms
-              << std::setw(16) << std::fixed << std::setprecision(4) << total_bm4_ms
-              << std::setw(16) << std::fixed << std::setprecision(4) << total_bm8_ms
-              << std::setw(16) << std::fixed << std::setprecision(4) << total_bm16_ms
+
+              << std::setw(16) << std::fixed << std::setprecision(4) << bm4_smem_ms
+              << std::setw(16) << std::fixed << std::setprecision(4) << bm8_smem_ms
+              << std::setw(16) << std::fixed << std::setprecision(4) << bm16_smem_ms
+
+              << std::setw(16) << std::fixed << std::setprecision(4) << bm4_reg_ms
+              << std::setw(16) << std::fixed << std::setprecision(4) << bm8_reg_ms
+              << std::setw(16) << std::fixed << std::setprecision(4) << bm16_reg_ms
 
               << std::setw(14) << std::fixed << std::setprecision(3) << tiled_speedup
-              << std::setw(14) << std::fixed << std::setprecision(3) << fused_vs_naive_speedup
-              << std::setw(14) << std::fixed << std::setprecision(3) << flash_vs_naive_speedup
-              << std::setw(14) << std::fixed << std::setprecision(3) << skip_vs_naive_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << fused_vs_naive
+              << std::setw(14) << std::fixed << std::setprecision(3) << flash_vs_naive
+              << std::setw(14) << std::fixed << std::setprecision(3) << skip_vs_naive
 
-              << std::setw(14) << std::fixed << std::setprecision(3) << flash_vs_tiled_speedup
-              << std::setw(14) << std::fixed << std::setprecision(3) << skip_vs_tiled_speedup
-              << std::setw(14) << std::fixed << std::setprecision(3) << skip_vs_flash_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << flash_vs_tiled
+              << std::setw(14) << std::fixed << std::setprecision(3) << skip_vs_tiled
+              << std::setw(14) << std::fixed << std::setprecision(3) << skip_vs_flash
 
-              << std::setw(14) << std::fixed << std::setprecision(3) << bm4_vs_flash_speedup
-              << std::setw(14) << std::fixed << std::setprecision(3) << bm8_vs_flash_speedup
-              << std::setw(14) << std::fixed << std::setprecision(3) << bm16_vs_flash_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << reg4_vs_smem
+              << std::setw(14) << std::fixed << std::setprecision(3) << reg8_vs_smem
+              << std::setw(14) << std::fixed << std::setprecision(3) << reg16_vs_smem
 
               << std::setw(12) << std::fixed << std::setprecision(2) << score_mb
               << std::setw(12) << std::fixed << std::setprecision(2) << qkv_mb
@@ -1056,9 +1163,14 @@ void run_one_config(const AttnConfig& cfg) {
               << std::setw(14) << std::scientific << std::setprecision(2) << fused_err
               << std::setw(14) << std::scientific << std::setprecision(2) << flash_err
               << std::setw(14) << std::scientific << std::setprecision(2) << skip_err
-              << std::setw(14) << std::scientific << std::setprecision(2) << bm4_err
-              << std::setw(14) << std::scientific << std::setprecision(2) << bm8_err
-              << std::setw(14) << std::scientific << std::setprecision(2) << bm16_err
+
+              << std::setw(14) << std::scientific << std::setprecision(2) << bm4_smem_err
+              << std::setw(14) << std::scientific << std::setprecision(2) << bm8_smem_err
+              << std::setw(14) << std::scientific << std::setprecision(2) << bm16_smem_err
+
+              << std::setw(14) << std::scientific << std::setprecision(2) << bm4_reg_err
+              << std::setw(14) << std::scientific << std::setprecision(2) << bm8_reg_err
+              << std::setw(14) << std::scientific << std::setprecision(2) << bm16_reg_err
               << "\n";
 
     CHECK_CUDA(cudaFree(d_Q));
@@ -1083,7 +1195,7 @@ int main() {
     std::cout << "Device: " << prop.name << "\n";
     std::cout << "SM count: " << prop.multiProcessorCount << "\n\n";
 
-    std::cout << "=== Causal Attention Forward: Naive vs Tiled vs Fused Row vs FlashAttention v1 vs Tile Skipping ===\n";
+    std::cout << "=== Causal Attention Forward: smem accumulator vs register accumulator ===\n";
 
     std::cout << std::left
               << std::setw(6) << "B"
@@ -1107,9 +1219,14 @@ int main() {
               << std::setw(16) << "total_fused"
               << std::setw(16) << "total_flash"
               << std::setw(16) << "total_skip"
-              << std::setw(16) << "bm4_ms"
-              << std::setw(16) << "bm8_ms"
-              << std::setw(16) << "bm16_ms"
+
+              << std::setw(16) << "bm4_smem"
+              << std::setw(16) << "bm8_smem"
+              << std::setw(16) << "bm16_smem"
+
+              << std::setw(16) << "bm4_reg"
+              << std::setw(16) << "bm8_reg"
+              << std::setw(16) << "bm16_reg"
 
               << std::setw(14) << "tiled/naive"
               << std::setw(14) << "fused/naive"
@@ -1120,9 +1237,9 @@ int main() {
               << std::setw(14) << "skip/tiled"
               << std::setw(14) << "skip/flash"
 
-              << std::setw(14) << "bm4/flash"
-              << std::setw(14) << "bm8/flash"
-              << std::setw(14) << "bm16/flash"
+              << std::setw(14) << "reg4/smem"
+              << std::setw(14) << "reg8/smem"
+              << std::setw(14) << "reg16/smem"
 
               << std::setw(12) << "score_MB"
               << std::setw(12) << "qkv_MB"
@@ -1132,9 +1249,14 @@ int main() {
               << std::setw(14) << "fused_err"
               << std::setw(14) << "flash_err"
               << std::setw(14) << "skip_err"
-              << std::setw(14) << "bm4_err"
-              << std::setw(14) << "bm8_err"
-              << std::setw(14) << "bm16_err"
+
+              << std::setw(14) << "bm4s_err"
+              << std::setw(14) << "bm8s_err"
+              << std::setw(14) << "bm16s_err"
+
+              << std::setw(14) << "bm4r_err"
+              << std::setw(14) << "bm8r_err"
+              << std::setw(14) << "bm16r_err"
               << "\n";
 
     std::vector<AttnConfig> configs = {
