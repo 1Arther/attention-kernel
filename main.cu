@@ -113,6 +113,46 @@ void launch_flash_attention_v1(
     int D
 );
 
+void launch_flash_attention_causal_tile_skipping(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+void launch_flash_attention_skip_bm4(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+void launch_flash_attention_skip_bm8(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+void launch_flash_attention_skip_bm16(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
 void attention_cpu_reference(
     const std::vector<float>& Q,
     const std::vector<float>& K,
@@ -136,6 +176,16 @@ struct AttnConfig {
     int repeat;
 };
 
+using FlashLauncher = void (*)(
+    const float*,
+    const float*,
+    const float*,
+    float*,
+    int,
+    int,
+    int
+);
+
 float max_abs_error(
     const std::vector<float>& ref,
     const std::vector<float>& out
@@ -147,6 +197,42 @@ float max_abs_error(
     }
 
     return err;
+}
+
+float check_flash_launcher_correctness(
+    FlashLauncher launcher,
+    const std::vector<float>& h_ref,
+    std::vector<float>& h_out,
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    size_t qkv_bytes,
+    int BH,
+    int S,
+    int D
+) {
+    launcher(
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CHECK_CUDA(cudaMemcpy(
+        h_out.data(),
+        d_O,
+        qkv_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+
+    return max_abs_error(h_ref, h_out);
 }
 
 // ============================================================
@@ -421,7 +507,8 @@ float benchmark_attention_total(
     return total_ms / static_cast<float>(repeat);
 }
 
-float benchmark_attention_fused_row(
+float benchmark_flash_launcher(
+    FlashLauncher launcher,
     const float* d_Q,
     const float* d_K,
     const float* d_V,
@@ -433,7 +520,7 @@ float benchmark_attention_fused_row(
     int repeat
 ) {
     for (int i = 0; i < warmup; ++i) {
-        launch_attention_forward_fused_row(
+        launcher(
             d_Q,
             d_K,
             d_V,
@@ -456,68 +543,7 @@ float benchmark_attention_fused_row(
     CHECK_CUDA(cudaEventRecord(start));
 
     for (int i = 0; i < repeat; ++i) {
-        launch_attention_forward_fused_row(
-            d_Q,
-            d_K,
-            d_V,
-            d_O,
-            BH,
-            S,
-            D
-        );
-    }
-
-    CHECK_CUDA(cudaEventRecord(stop));
-    CHECK_CUDA(cudaEventSynchronize(stop));
-
-    float total_ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
-
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
-
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    return total_ms / static_cast<float>(repeat);
-}
-
-float benchmark_flash_attention_v1(
-    const float* d_Q,
-    const float* d_K,
-    const float* d_V,
-    float* d_O,
-    int BH,
-    int S,
-    int D,
-    int warmup,
-    int repeat
-) {
-    for (int i = 0; i < warmup; ++i) {
-        launch_flash_attention_v1(
-            d_Q,
-            d_K,
-            d_V,
-            d_O,
-            BH,
-            S,
-            D
-        );
-    }
-
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    cudaEvent_t start;
-    cudaEvent_t stop;
-
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
-
-    CHECK_CUDA(cudaEventRecord(start));
-
-    for (int i = 0; i < repeat; ++i) {
-        launch_flash_attention_v1(
+        launcher(
             d_Q,
             d_K,
             d_V,
@@ -628,7 +654,7 @@ void run_one_config(const AttnConfig& cfg) {
     ));
 
     // ============================================================
-    // correctness: naive total
+    // correctness
     // ============================================================
 
     launch_attention_forward(
@@ -655,10 +681,6 @@ void run_one_config(const AttnConfig& cfg) {
 
     float naive_err = max_abs_error(h_ref, h_out);
 
-    // ============================================================
-    // correctness: tiled total
-    // ============================================================
-
     launch_attention_forward_tiled(
         d_Q,
         d_K,
@@ -683,57 +705,89 @@ void run_one_config(const AttnConfig& cfg) {
 
     float tiled_err = max_abs_error(h_ref, h_out);
 
-    // ============================================================
-    // correctness: fused row
-    // ============================================================
-
-    launch_attention_forward_fused_row(
+    float fused_err = check_flash_launcher_correctness(
+        launch_attention_forward_fused_row,
+        h_ref,
+        h_out,
         d_Q,
         d_K,
         d_V,
         d_O,
+        qkv_bytes,
         BH,
         S,
         D
     );
 
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    CHECK_CUDA(cudaMemcpy(
-        h_out.data(),
-        d_O,
-        qkv_bytes,
-        cudaMemcpyDeviceToHost
-    ));
-
-    float fused_err = max_abs_error(h_ref, h_out);
-
-    // ============================================================
-    // correctness: flash attention v1
-    // ============================================================
-
-    launch_flash_attention_v1(
+    float flash_err = check_flash_launcher_correctness(
+        launch_flash_attention_v1,
+        h_ref,
+        h_out,
         d_Q,
         d_K,
         d_V,
         d_O,
+        qkv_bytes,
         BH,
         S,
         D
     );
 
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
-
-    CHECK_CUDA(cudaMemcpy(
-        h_out.data(),
+    float skip_err = check_flash_launcher_correctness(
+        launch_flash_attention_causal_tile_skipping,
+        h_ref,
+        h_out,
+        d_Q,
+        d_K,
+        d_V,
         d_O,
         qkv_bytes,
-        cudaMemcpyDeviceToHost
-    ));
+        BH,
+        S,
+        D
+    );
 
-    float flash_err = max_abs_error(h_ref, h_out);
+    float bm4_err = check_flash_launcher_correctness(
+        launch_flash_attention_skip_bm4,
+        h_ref,
+        h_out,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        qkv_bytes,
+        BH,
+        S,
+        D
+    );
+
+    float bm8_err = check_flash_launcher_correctness(
+        launch_flash_attention_skip_bm8,
+        h_ref,
+        h_out,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        qkv_bytes,
+        BH,
+        S,
+        D
+    );
+
+    float bm16_err = check_flash_launcher_correctness(
+        launch_flash_attention_skip_bm16,
+        h_ref,
+        h_out,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        qkv_bytes,
+        BH,
+        S,
+        D
+    );
 
     // ============================================================
     // stage-wise timing
@@ -763,7 +817,6 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    // prepare scores for softmax benchmark
     launch_qk_matmul_tiled(
         d_Q,
         d_K,
@@ -786,7 +839,6 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    // prepare probs for PV benchmark
     float scale = 1.0f / std::sqrt(static_cast<float>(D));
 
     launch_scaled_causal_softmax(
@@ -856,7 +908,8 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    float total_fused_ms = benchmark_attention_fused_row(
+    float total_fused_ms = benchmark_flash_launcher(
+        launch_attention_forward_fused_row,
         d_Q,
         d_K,
         d_V,
@@ -868,7 +921,60 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
-    float total_flash_ms = benchmark_flash_attention_v1(
+    float total_flash_ms = benchmark_flash_launcher(
+        launch_flash_attention_v1,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    float total_skip_ms = benchmark_flash_launcher(
+        launch_flash_attention_causal_tile_skipping,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    float total_bm4_ms = benchmark_flash_launcher(
+        launch_flash_attention_skip_bm4,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    float total_bm8_ms = benchmark_flash_launcher(
+        launch_flash_attention_skip_bm8,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    float total_bm16_ms = benchmark_flash_launcher(
+        launch_flash_attention_skip_bm16,
         d_Q,
         d_K,
         d_V,
@@ -890,9 +996,15 @@ void run_one_config(const AttnConfig& cfg) {
     double tiled_speedup = total_naive_ms / total_tiled_ms;
     double fused_vs_naive_speedup = total_naive_ms / total_fused_ms;
     double flash_vs_naive_speedup = total_naive_ms / total_flash_ms;
+    double skip_vs_naive_speedup = total_naive_ms / total_skip_ms;
 
     double flash_vs_tiled_speedup = total_tiled_ms / total_flash_ms;
-    double flash_vs_fused_speedup = total_fused_ms / total_flash_ms;
+    double skip_vs_tiled_speedup = total_tiled_ms / total_skip_ms;
+    double skip_vs_flash_speedup = total_flash_ms / total_skip_ms;
+
+    double bm4_vs_flash_speedup = total_flash_ms / total_bm4_ms;
+    double bm8_vs_flash_speedup = total_flash_ms / total_bm8_ms;
+    double bm16_vs_flash_speedup = total_flash_ms / total_bm16_ms;
 
     double score_mb = static_cast<double>(score_bytes) / 1024.0 / 1024.0;
     double qkv_mb = static_cast<double>(qkv_bytes) / 1024.0 / 1024.0;
@@ -918,13 +1030,23 @@ void run_one_config(const AttnConfig& cfg) {
               << std::setw(16) << std::fixed << std::setprecision(4) << total_tiled_ms
               << std::setw(16) << std::fixed << std::setprecision(4) << total_fused_ms
               << std::setw(16) << std::fixed << std::setprecision(4) << total_flash_ms
+              << std::setw(16) << std::fixed << std::setprecision(4) << total_skip_ms
+              << std::setw(16) << std::fixed << std::setprecision(4) << total_bm4_ms
+              << std::setw(16) << std::fixed << std::setprecision(4) << total_bm8_ms
+              << std::setw(16) << std::fixed << std::setprecision(4) << total_bm16_ms
 
               << std::setw(14) << std::fixed << std::setprecision(3) << tiled_speedup
               << std::setw(14) << std::fixed << std::setprecision(3) << fused_vs_naive_speedup
               << std::setw(14) << std::fixed << std::setprecision(3) << flash_vs_naive_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << skip_vs_naive_speedup
 
               << std::setw(14) << std::fixed << std::setprecision(3) << flash_vs_tiled_speedup
-              << std::setw(14) << std::fixed << std::setprecision(3) << flash_vs_fused_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << skip_vs_tiled_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << skip_vs_flash_speedup
+
+              << std::setw(14) << std::fixed << std::setprecision(3) << bm4_vs_flash_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << bm8_vs_flash_speedup
+              << std::setw(14) << std::fixed << std::setprecision(3) << bm16_vs_flash_speedup
 
               << std::setw(12) << std::fixed << std::setprecision(2) << score_mb
               << std::setw(12) << std::fixed << std::setprecision(2) << qkv_mb
@@ -933,6 +1055,10 @@ void run_one_config(const AttnConfig& cfg) {
               << std::setw(14) << std::scientific << std::setprecision(2) << tiled_err
               << std::setw(14) << std::scientific << std::setprecision(2) << fused_err
               << std::setw(14) << std::scientific << std::setprecision(2) << flash_err
+              << std::setw(14) << std::scientific << std::setprecision(2) << skip_err
+              << std::setw(14) << std::scientific << std::setprecision(2) << bm4_err
+              << std::setw(14) << std::scientific << std::setprecision(2) << bm8_err
+              << std::setw(14) << std::scientific << std::setprecision(2) << bm16_err
               << "\n";
 
     CHECK_CUDA(cudaFree(d_Q));
@@ -957,7 +1083,7 @@ int main() {
     std::cout << "Device: " << prop.name << "\n";
     std::cout << "SM count: " << prop.multiProcessorCount << "\n\n";
 
-    std::cout << "=== Causal Attention Forward: Naive vs Tiled vs Fused Row vs FlashAttention v1 ===\n";
+    std::cout << "=== Causal Attention Forward: Naive vs Tiled vs Fused Row vs FlashAttention v1 vs Tile Skipping ===\n";
 
     std::cout << std::left
               << std::setw(6) << "B"
@@ -980,13 +1106,23 @@ int main() {
               << std::setw(16) << "total_tiled"
               << std::setw(16) << "total_fused"
               << std::setw(16) << "total_flash"
+              << std::setw(16) << "total_skip"
+              << std::setw(16) << "bm4_ms"
+              << std::setw(16) << "bm8_ms"
+              << std::setw(16) << "bm16_ms"
 
-              << std::setw(14) << "tiled_spd"
+              << std::setw(14) << "tiled/naive"
               << std::setw(14) << "fused/naive"
               << std::setw(14) << "flash/naive"
+              << std::setw(14) << "skip/naive"
 
               << std::setw(14) << "flash/tiled"
-              << std::setw(14) << "flash/fused"
+              << std::setw(14) << "skip/tiled"
+              << std::setw(14) << "skip/flash"
+
+              << std::setw(14) << "bm4/flash"
+              << std::setw(14) << "bm8/flash"
+              << std::setw(14) << "bm16/flash"
 
               << std::setw(12) << "score_MB"
               << std::setw(12) << "qkv_MB"
@@ -995,6 +1131,10 @@ int main() {
               << std::setw(14) << "tiled_err"
               << std::setw(14) << "fused_err"
               << std::setw(14) << "flash_err"
+              << std::setw(14) << "skip_err"
+              << std::setw(14) << "bm4_err"
+              << std::setw(14) << "bm8_err"
+              << std::setw(14) << "bm16_err"
               << "\n";
 
     std::vector<AttnConfig> configs = {
