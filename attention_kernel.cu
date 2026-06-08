@@ -3002,6 +3002,117 @@ void launch_flash_attention_causal_tile_skipping_vec4(
     }
 }
 
+
+void launch_flash_attention_skip_bm16_regacc_vec4_pcache(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+) {
+    constexpr int BLOCK_M = 16;
+    constexpr int BLOCK_N = 32;
+    constexpr int MAX_D = 64;
+
+    if (D > MAX_D) {
+        fprintf(stderr, "flash_attention_skip_bm16_regacc_vec4_pcache only supports D <= %d, got D = %d\n", MAX_D, D);
+        return;
+    }
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    dim3 grid((S + BLOCK_M - 1) / BLOCK_M, BH);
+    dim3 block(128);
+
+    flash_attention_causal_tile_skipping_regacc_vec4_pcache_kernel<BLOCK_M, BLOCK_N, MAX_D>
+        <<<grid, block>>>(
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D,
+            scale
+        );
+}
+
+void launch_flash_attention_skip_bm4_regacc_vec4_pcache(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+) {
+    constexpr int BLOCK_M = 4;
+    constexpr int BLOCK_N = 32;
+    constexpr int MAX_D = 128;
+
+    if (D > MAX_D) {
+        fprintf(stderr, "flash_attention_skip_bm16_regacc_vec4_pcache only supports D <= %d, got D = %d\n", MAX_D, D);
+        return;
+    }
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    dim3 grid((S + BLOCK_M - 1) / BLOCK_M, BH);
+    dim3 block(128);
+
+    flash_attention_causal_tile_skipping_regacc_vec4_pcache_kernel<BLOCK_M, BLOCK_N, MAX_D>
+        <<<grid, block>>>(
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D,
+            scale
+        );
+}
+
+
+void launch_flash_attention_skip_bm8_regacc_vec4_pcache(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+) {
+    constexpr int BLOCK_M = 8;
+    constexpr int BLOCK_N = 32;
+    constexpr int MAX_D = 128;
+
+    if (D > MAX_D) {
+        fprintf(stderr, "flash_attention_skip_bm16_regacc_vec4_pcache only supports D <= %d, got D = %d\n", MAX_D, D);
+        return;
+    }
+
+    float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    dim3 grid((S + BLOCK_M - 1) / BLOCK_M, BH);
+    dim3 block(128);
+
+    flash_attention_causal_tile_skipping_regacc_vec4_pcache_kernel<BLOCK_M, BLOCK_N, MAX_D>
+        <<<grid, block>>>(
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D,
+            scale
+        );
+}
+
+//默认
 void launch_flash_attention_causal_tile_skipping(
     const float* d_Q,
     const float* d_K,
@@ -3011,13 +3122,45 @@ void launch_flash_attention_causal_tile_skipping(
     int S,
     int D
 ) {
-    if (D <= 64 && S >= 256) {
+    if (S >= 512 && D <= 64) {
         launch_flash_attention_skip_bm16_regacc_vec4_pcache(
-            d_Q, d_K, d_V, d_O, BH, S, D
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D
+        );
+    } else if (S >= 256 && D <= 128) {
+        launch_flash_attention_skip_bm8_regacc_vec4_pcache(
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D
+        );
+    } else if (D <= 128) {
+        launch_flash_attention_skip_bm4_regacc_vec4_pcache(
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D
         );
     } else {
         launch_flash_attention_causal_tile_skipping_vec4(
-            d_Q, d_K, d_V, d_O, BH, S, D
+            d_Q,
+            d_K,
+            d_V,
+            d_O,
+            BH,
+            S,
+            D
         );
     }
 }
@@ -3058,38 +3201,5 @@ void launch_flash_attention_skip_bm16_regacc_vec4_noscore(
         );
 }
 
-void launch_flash_attention_skip_bm16_regacc_vec4_pcache(
-    const float* d_Q,
-    const float* d_K,
-    const float* d_V,
-    float* d_O,
-    int BH,
-    int S,
-    int D
-) {
-    constexpr int BLOCK_M = 16;
-    constexpr int BLOCK_N = 32;
-    constexpr int MAX_D = 64;
 
-    if (D > MAX_D) {
-        fprintf(stderr, "flash_attention_skip_bm16_regacc_vec4_pcache only supports D <= %d, got D = %d\n", MAX_D, D);
-        return;
-    }
 
-    float scale = 1.0f / std::sqrt(static_cast<float>(D));
-
-    dim3 grid((S + BLOCK_M - 1) / BLOCK_M, BH);
-    dim3 block(128);
-
-    flash_attention_causal_tile_skipping_regacc_vec4_pcache_kernel<BLOCK_M, BLOCK_N, MAX_D>
-        <<<grid, block>>>(
-            d_Q,
-            d_K,
-            d_V,
-            d_O,
-            BH,
-            S,
-            D,
-            scale
-        );
-}
