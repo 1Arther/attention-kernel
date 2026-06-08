@@ -1,387 +1,253 @@
-# CUDA Causal Attention Kernel Lab
+# CUDA Causal Attention Kernel Optimization
 
-本项目从零实现并测试了多个 CUDA Causal Attention Forward 算子，用于理解 Attention 从 naive 实现、shared-memory tiled 优化、fused attention，再到 FlashAttention-style online softmax 的演进过程。
+本项目从零实现并逐步优化 Causal Attention Forward，用于学习和验证 Transformer Attention 中常见 CUDA kernel 优化方法。
 
-当前版本在 `flash-attention-v1` 的基础上，进一步加入了：
-
-- Causal tile skipping
-- BM4 / BM8 / BM16 多种 query tile size 测试
-- 基于序列长度的简单 dispatch
-- FlashAttention v1 与 tile skipping 版本的性能对比
-
----
-
-## 1. 张量布局
-
-所有张量均采用 row-major 布局：
+Attention 计算形式为：
 
 ```text
-Q:      [BH, S, D]
-K:      [BH, S, D]
-V:      [BH, S, D]
-O:      [BH, S, D]
-
-scores: [BH, S, S]
-probs:  [BH, S, S]
-
-其中：
-
-BH = B * H
-B  = batch size
-H  = number of heads
-S  = sequence length
-D  = head dimension
-
-Causal Attention Forward 计算公式为：
-
 scores = Q @ K^T / sqrt(D)
 probs  = causal_softmax(scores)
 O      = probs @ V
 
-代码中的一维访问方式为：
+其中：
 
-Q[bh, q, d] = Q[bh * S * D + q * D + d]
-K[bh, k, d] = K[bh * S * D + k * D + d]
-V[bh, k, d] = V[bh * S * D + k * D + d]
-O[bh, q, d] = O[bh * S * D + q * D + d]
-2. 已实现版本
-版本	说明
-Naive Unfused Attention	QK、softmax、PV 三阶段分开实现
-Shared-memory Tiled Attention	对 QK 和 PV 使用 shared memory tiling
-Fused Row Attention	一个 block 处理一个 query row，不落地 global scores/probs
-FlashAttention v1	一个 block 处理多个 query，使用 online softmax
-FlashAttention + Tile Skipping	在 v1 基础上跳过 causal attention 中无效的未来 K/V tile
-BM4 / BM8 / BM16 Dispatch	根据序列长度选择不同 BLOCK_M 配置
-3. Naive Unfused Attention
+B：batch size
+H：attention head 数
+BH = B * H
+S：sequence length
+D：head dimension
+Q/K/V/O shape 均为 [BH, S, D]
+scores/probs shape 为 [BH, S, S]
 
-Naive Attention 被拆成三个 kernel：
+当前主要针对 float32、causal attention、D=64 场景进行优化和 benchmark。
 
-1. scores = Q @ K^T
-2. probs  = scaled_causal_softmax(scores)
-3. O      = probs @ V
+1. 实现版本
 
-该版本结构简单，但会显式保存：
+项目中包含以下几个版本：
 
-scores: [BH, S, S]
-probs:  [BH, S, S]
+1.1 Naive Unfused Attention
 
-随着序列长度 S 增大，中间矩阵的显存占用和访存开销会快速上升。
+最基础的三阶段实现：
 
-4. Shared-memory Tiled Attention
+QK MatMul -> Causal Softmax -> PV MatMul
 
-Tiled 版本仍然保持三阶段流程：
+特点：
 
-tiled QK -> causal softmax -> tiled PV
+每个阶段单独 kernel
+中间显式写出 scores 和 probs
+方便验证正确性和作为 baseline
 
-其中 QK 和 PV 使用 shared memory tile 来减少 global memory 重复读取。
+缺点：
 
-QK 计算：
+需要读写完整 scores/probs
+kernel launch 次数多
+global memory traffic 较大
+1.2 Tiled QK / PV
 
-scores[bh, q, k] = sum_d Q[bh, q, d] * K[bh, k, d]
+对 QK 和 PV 分别实现 shared memory tiled matmul。
 
-PV 计算：
+优化点：
 
-O[bh, q, d] = sum_k probs[bh, q, k] * V[bh, k, d]
+Q/K/V tile 加载到 shared memory
+减少 global memory 重复访问
+QK 和 PV 相比 naive 均有明显加速
+1.3 Fused Row Attention
 
-需要注意：
+实现一行 query 对应一个 CUDA block 的 fused attention：
 
-QK 沿 D 维归约
-PV 沿 S 维归约
+一个 block 负责一个 query row
+QK + softmax + PV 在一个 kernel 内完成
 
-当前实验中，tiled unfused 版本仍然是性能最好的 baseline。
+优化点：
 
-5. Fused Row Attention
+不再显式写出完整 scores/probs
+减少 kernel launch
+对小序列场景有一定优势
 
-Fused row 版本中，一个 CUDA block 负责一个 attention row：
+局限：
 
-one block -> one (bh, q)
+每个 block 只处理一个 query row
+并行度和数据复用有限
+对较大 BH/S 场景不一定优于 tiled unfused
+1.4 FlashAttention v1
 
-在一个 kernel 内完成：
+实现 FlashAttention v1 风格的 online softmax。
 
-1. score[k] = Q[q] · K[k] / sqrt(D)
-2. 对 k <= q 做 causal softmax
-3. O[q, d] = sum_k prob[k] * V[k, d]
+核心思想：
 
-该版本不再保存 global scores/probs，但由于一个 block 只处理一个 query row，K/V 跨 query 复用不足，因此大序列下不一定比 tiled unfused 更快。
+一个 block 处理 BLOCK_M 个 query
+每轮处理 BLOCK_N 个 key/value
+使用 online softmax 维护每个 query row 的 running max m 和 running sum l
+避免显式保存完整 S x S attention matrix
 
-6. FlashAttention v1
+online softmax 更新公式：
 
-FlashAttention v1 使用 tile-based attention 和 online softmax。
+m_new = max(m_old, tile_max)
+l_new = exp(m_old - m_new) * l_old + sum(exp(score - m_new))
+acc_new = exp(m_old - m_new) * acc_old + sum(exp(score - m_new) * V)
+1.5 Causal Tile Skipping
 
-当前基础配置：
+在 causal attention 中，当当前 K/V tile 完全位于 query block 右侧时，该 tile 对所有 query 都不可见，可以直接跳过。
 
-BLOCK_M = 4
-BLOCK_N = 32
-MAX_D   = 128
-
-一个 block 处理：
-
-Q tile:     [BLOCK_M, D]
-K tile:     [BLOCK_N, D]
-V tile:     [BLOCK_N, D]
-score tile: [BLOCK_M, BLOCK_N]
-acc tile:   [BLOCK_M, D]
-
-它不保存完整的：
-
-scores: [BH, S, S]
-probs:  [BH, S, S]
-
-而是分块遍历 K/V tile，并对每个 query 维护：
-
-m   = running max score
-l   = running softmax denominator
-acc = running output accumulator
-
-每处理一个 K/V tile，执行：
-
-score_tile = Q_tile @ K_tile^T / sqrt(D)
-
-m_new = max(m_old, max(score_tile))
-
-l_new =
-    exp(m_old - m_new) * l_old
-    + sum(exp(score_tile - m_new))
-
-acc_new =
-    exp(m_old - m_new) * acc_old
-    + exp(score_tile - m_new) @ V_tile
-
-最后：
-
-O = acc / l
-
-这就是 FlashAttention 的核心思想：只保存局部 tile，不保存完整 attention matrix，同时保持 softmax 数值稳定。
-
-7. Causal Tile Skipping
-
-在 causal attention 中，第 q 个 query 只能看：
-
-k <= q
-
-对于一个 query block：
-
-q_start, q_start + 1, ..., q_start + BLOCK_M - 1
-
-它能看到的最大 key 位置是：
-
-q_end = min(q_start + BLOCK_M - 1, S - 1)
-
-如果当前 K/V tile 的起点满足：
-
-k_start > q_end
-
-说明这个 K/V tile 以及后续 K/V tile 全部都是未来 token，可以直接跳过。
-
-因此 tile skipping 版本在 K/V tile 主循环中加入：
+优化点：
 
 if (k_start > q_end) {
     break;
 }
 
-这个优化对长序列更有效，因为长序列中可跳过的未来 tile 更多。
+作用：
 
-8. BM4 / BM8 / BM16 Dispatch
+减少无效 K/V tile 计算
+对长序列 causal attention 有明显收益
+1.6 Register Accumulator
 
-为了测试不同 query tile size 的影响，本项目实现了三个 launcher：
+原始版本使用 shared memory 保存 accumulator：
 
-launch_flash_attention_skip_bm4
-launch_flash_attention_skip_bm8
-launch_flash_attention_skip_bm16
+acc_smem[BLOCK_M][MAX_D]
 
-对应：
+register accumulator 版本将每个线程负责的 accumulator 保存在寄存器中，减少 shared memory 读写。
 
-BM4:  BLOCK_M = 4,  BLOCK_N = 32
-BM8:  BLOCK_M = 8,  BLOCK_N = 32
-BM16: BLOCK_M = 16, BLOCK_N = 32
+实验结论：
 
-其中 BM16 使用：
+register accumulator 并不是所有 shape 都更快
+短序列下可能因为寄存器压力和额外控制逻辑变慢
+长序列下，尤其是 S=512,D=64，BM16 regacc 有明显收益
+1.7 Float4 Vectorized Load
 
-MAX_D = 64
+在 regacc 版本基础上，进一步使用 float4 向量化加载 Q/K/V：
 
-原因是 BLOCK_M=16, MAX_D=128 会导致 shared memory 超过默认单 block 48KB 限制。
+float4 q_vec = *reinterpret_cast<const float4*>(q_gmem);
+float4 k_vec = *reinterpret_cast<const float4*>(k_gmem);
+float4 v_vec = *reinterpret_cast<const float4*>(v_gmem);
 
-最终 dispatch 规则：
+条件：
 
-if (S >= 512 && D <= 64) {
-    use BM16;
-} else if (S >= 256) {
-    use BM8;
-} else {
-    use BM4;
-}
+D % 4 == 0
 
-实验表明：
+当前 benchmark 主要使用 D=64，因此满足 float4 对齐和连续访问条件。
 
-短序列下 BM4 更稳
-S=256 时 BM8 略优
-S=512 时 BM16 最优
-9. 编译运行
+优化点：
 
-A40：
+Q/K/V 从 global memory 到 shared memory 的加载更高效
+不改变 attention 计算逻辑
+正确性保持在 1e-7 量级
+2. Noscore 实验
 
-rm -f attention_bench
-nvcc -O3 -std=c++17 -arch=sm_86 main.cu attention_kernel.cu -o attention_bench
-./attention_bench
+在 regacc + float4 基础上，尝试去掉：
 
-RTX 4090 / Ada GPU：
+score_smem[BLOCK_M][BLOCK_N]
 
-rm -f attention_bench
-nvcc -O3 -std=c++17 -arch=sm_89 main.cu attention_kernel.cu -o attention_bench
-./attention_bench
-10. Benchmark 环境
+即不再保存 score tile，而是通过重复计算 QK 来完成：
 
-测试 GPU：
+1. 第一次计算 score，用于求 tile_max
+2. 第二次计算 score，用于求 tile_sum
+3. 第三次计算 score，用于更新 acc
 
-NVIDIA A40
+该版本命名为 noscore v0。
+
+实验结论
+
+noscore v0 正确性通过，但性能严重退化。
+
+以 B=1,H=8,S=512,D=64 为例：
+
+BM16 vec4      = 0.4627 ms
+BM16 noscore   = 2.8765 ms
+noscore / vec4 = 0.161x
+
+也就是说 noscore v0 比 BM16 vec4 慢约：
+
+2.8765 / 0.4627 ≈ 6.2x
+
+原因：
+
+虽然减少了 score_smem 读写
+但是 QK dot 被重复计算过多
+对 D=64 场景，重复计算成本远大于 shared memory 读写成本
+
+因此，noscore v0 仅作为失败实验保留，不进入默认 dispatch。
+
+3. Probability Cache Optimization
+
+noscore 实验说明，直接去掉 score_smem 不划算。进一步分析发现，原始 vec4 版本中存在大量重复 expf：
+
+for each (qi, d):
+    for each kj:
+        p = expf(score_smem[qi][kj] - m_new)
+        acc += p * V[kj][d]
+
+同一个 p(qi,kj) 会被不同输出维度 d 重复计算多次。
+
+因此实现 probability cache 优化：
+
+1. score_smem 先保存 score
+2. 求出 m_new 后，将 score_smem 原地覆盖为 p = exp(score - m_new)
+3. acc update 阶段直接读取 p，不再重复 expf
+
+即：
+
+score_smem[qi][kj] = p;
+
+此时 score_smem 变成了临时的 probability cache。
+
+4. Benchmark Results
+
+测试环境：
+
+GPU: NVIDIA A40
 SM count: 84
+CUDA arch: sm_86
+Data type: float32
 
-测试 shape：
+编译命令：
 
-B = 1
-H = 1 / 8
-S = 64 / 128 / 256 / 512
-D = 64
-11. Benchmark 结果
-=== Causal Attention Forward: Naive vs Tiled vs Fused Row vs FlashAttention v1 vs Tile Skipping ===
-B     H     BH      S       D       total_naive     total_tiled     total_fused     total_flash     total_skip      bm4_ms          bm8_ms          bm16_ms
-1     1     1       64      64      0.0196          0.0103          0.0076          0.0186          0.0186          0.0186          0.0271          0.0426
-1     1     1       128     64      0.0224          0.0125          0.0124          0.0346          0.0346          0.0346          0.0509          0.0825
-1     8     8       128     64      0.0915          0.0279          0.0511          0.0790          0.0659          0.0658          0.0679          0.0831
-1     8     8       256     64      0.2993          0.0726          0.1594          0.2607          0.1979          0.1998          0.1975          0.2216
-1     8     8       512     64      1.1381          0.2479          0.5671          0.9301          0.5821          0.6553          0.5958          0.5837
+nvcc -O3 -std=c++17 -arch=sm_86 main.cu attention_kernel.cu -o attention_bench
 
-所有版本误差均保持在 1e-7 量级。
+运行命令：
 
-12. 结果分析
-12.1 Tiled unfused 仍然最快
+./attention_bench
+4.1 关键结果：B=1,H=8,S=512,D=64
+Version	Time
+Naive unfused	1.1378 ms
+Tiled unfused	0.2477 ms
+FlashAttention v1	0.9306 ms
+Regacc + float4 dispatch	0.4626 ms
+BM16 noscore v0	2.8765 ms
+BM16 pcache	0.3344 ms
 
-在 B=1,H=8,S=512,D=64 下：
+相较 FlashAttention v1：
 
-total_naive = 1.1381 ms
-total_tiled = 0.2479 ms
+FlashAttention v1 = 0.9306 ms
+BM16 pcache       = 0.3344 ms
+speedup           = 2.78x
 
-tiled unfused 通过 shared memory tile 复用 Q/K/V，在当前实现中仍然是最快版本。
+相较 BM16 vec4：
 
-12.2 FlashAttention v1 正确但不够快
+BM16 vec4   = 0.4627 ms
+BM16 pcache = 0.3344 ms
+speedup     = 1.38x
+4.2 关键结果：B=1,H=8,S=256,D=64
+Version	Time
+FlashAttention v1	0.2606 ms
+BM8 vec4 dispatch	0.1550 ms
+BM16 pcache	0.1316 ms
 
-在 B=1,H=8,S=512,D=64 下：
+相较当前 vec4 dispatch：
 
-total_flash = 0.9301 ms
+BM8 vec4 dispatch = 0.1550 ms
+BM16 pcache       = 0.1316 ms
+speedup           = 1.18x
+5. Final Dispatch Strategy
 
-它比 naive 快，但明显慢于 tiled unfused。主要原因是当前版本是教学实现：
+当前最终默认 dispatch 策略：
 
-1. QK 使用普通 FP32 for-loop，没有 Tensor Core / MMA。
-2. online softmax 的 max/sum 更新比较串行。
-3. acc_smem 放在 shared memory 中，没有寄存器化。
-4. 没有 float4 向量化加载。
-5. 没有 warp-level 高效 softmax 优化。
-12.3 Tile skipping 有明显收益
-
-在 B=1,H=8,S=512,D=64 下：
-
-total_flash = 0.9301 ms
-total_skip  = 0.5821 ms
-
-相对原始 FlashAttention v1：
-
-speedup = 0.9301 / 0.5821 ≈ 1.60x
-
-说明 causal tile skipping 对长序列有效。
-
-12.4 BM4 / BM8 / BM16 的适用范围不同
-
-实验结果显示：
-
-S=64 / S=128：BM4 更快
-S=256：BM8 略快
-S=512：BM16 更快
-
-因此使用基于 S 的简单 dispatch 更合理。
-
-13. 当前结论
-
-本项目展示了 causal attention kernel 的演进路径：
-
-naive attention
--> shared-memory tiled attention
--> fused row attention
--> FlashAttention-style online softmax
--> causal tile skipping + tile-size dispatch
-
-当前版本已经验证：
-
-1. FlashAttention online softmax 正确性
-2. causal tile skipping 的有效性
-3. 不同 BLOCK_M 对不同序列长度的性能影响
-4. 基于 shape 的 dispatch 是有必要的
-14. 后续优化方向
-
-后续可以继续优化：
-
-1. 将 acc_smem 寄存器化，减少 shared memory 读写。
-2. 去掉 score_smem，边算 score 边更新 tile max / tile sum。
-3. 使用 float4 向量化加载 Q/K/V。
-4. 使用 warp-level reduction 优化 online softmax。
-5. 使用 Tensor Core / WMMA 加速 QK 和 PV。
-6. 增加 D=128、S=1024/2048 的测试。
-7. 与 PyTorch / cuDNN / 官方 FlashAttention 实现对比。
-15. 面试讲法
-
-可以这样讲：
-
-我实现了一个 CUDA causal attention benchmark，先从 naive 三阶段 attention 开始，然后实现 shared-memory tiled QK 和 tiled PV。之后实现 fused row attention，在一个 kernel 中完成 QK、causal softmax 和 PV，不再落地 global scores/probs。
-
-在此基础上，我实现了 FlashAttention-style v1。一个 block 处理多个 query，并按 K/V tile 分块遍历；每个 query 维护 running max、running softmax sum 和 output accumulator，通过 online softmax 避免保存完整 attention matrix。
-
-随后我进一步加入 causal tile skipping。对于 causal attention，如果当前 K/V tile 全部位于 query block 的未来位置，就直接跳过。实验中，在 B=1,H=8,S=512,D=64 下，FlashAttention v1 从 0.9301 ms 优化到 0.5821 ms，提升约 1.60 倍，误差仍保持在 1e-7 量级。
-
-我还测试了 BM4、BM8、BM16 三种 query tile size，发现短序列下 BM4 更稳，S=256 时 BM8 略优，S=512 时 BM16 最优，因此实现了基于序列长度的 dispatch。
-
-## Register Accumulator Optimization
-
-在 FlashAttention tile-skipping 版本基础上，进一步实现了 register accumulator 版本，将原先存放在 shared memory 中的 `acc_smem[BLOCK_M][MAX_D]` 改为每个线程私有的寄存器累加变量，以减少跨 K/V tile 更新时的 shared memory 读写。
-
-实验结果表明，register accumulator 并不是所有 shape 都更快。对于短序列，BM4 regacc 由于寄存器压力和额外指令开销，反而慢于 BM4 smem；但对于较长序列，尤其是 `S=512,D=64`，BM16 regacc 能有效减少 repeated shared-memory traffic。
-
-在 `B=1,H=8,S=512,D=64` 下：
-
-```text
-FlashAttention v1       = 0.9307 ms
-Tile skipping dispatch  = 0.5206 ms
-BM16 smem               = 0.5799 ms
-BM16 regacc             = 0.5183 ms
-
-相较原始 FlashAttention v1，最终 dispatch 版本达到约 1.79x 加速；相较 BM16 smem，BM16 regacc 达到约 1.12x 加速。所有版本误差均保持在 1e-7 量级。
-
-最终采用 hybrid dispatch：
-
-if (S >= 512 && D <= 64) {
-    use BM16 regacc;
-} else if (S >= 256) {
-    use BM8 regacc;
+if (D <= 64 && S >= 256) {
+    use BM16 regacc vec4 pcache;
 } else {
-    use BM4 smem;
+    use regacc vec4 dispatch;
 }
 
-该策略避免了小序列下 regacc 变慢的问题，同时保留长序列下 register accumulator 的收益。
-
-## Float4 Vectorized Load
-
-在 register-accumulator FlashAttention 版本基础上，进一步加入了 `float4` 向量化加载，用于优化 Q/K/V 从 global memory 到 shared memory 的搬运。当 `D % 4 == 0` 时，kernel 使用 `float4` 一次读取 4 个连续 float；否则回退到 scalar load。
-
-该优化不改变 attention 计算逻辑，只优化 Q/K/V tile load 路径。
-
-实验结果显示，`float4` 对 regacc 版本有稳定收益。以 `B=1,H=8,S=512,D=64` 为例：
-
-```text
-FlashAttention v1        = 0.9302 ms
-Regacc dispatch          = 0.5183 ms
-Regacc + float4 dispatch = 0.4626 ms
-
-相较原始 FlashAttention v1，最终版本达到约 2.01x 加速；相较 regacc scalar-load 版本，float4 进一步带来约 1.12x 加速。
-
-最终 dispatch 策略为：
+其中 vec4 dispatch 内部为：
 
 if (S >= 512 && D <= 64) {
     use BM16 regacc vec4;
@@ -391,4 +257,56 @@ if (S >= 512 && D <= 64) {
     use BM4 regacc vec4;
 }
 
-所有版本误差均保持在 1e-7 量级。
+这样可以避免小序列下 BM16 pcache 控制逻辑过重，同时保留中长序列下 pcache 的收益。
+
+6. Correctness
+
+所有 CUDA kernel 都与 CPU reference 对齐，最大误差保持在：
+
+1e-7 ~ 1e-6
+
+典型结果：
+
+flash_err   ≈ 1.9e-7
+v4_err      ≈ 1.9e-7
+noscore_err ≈ 1.9e-7
+pcache_err  ≈ 1.9e-7
+7. Lessons Learned
+7.1 Noscore 不一定更快
+
+去掉 shared memory 并不一定会提升性能。对于当前实现，score_smem 的读写成本远小于重复 QK dot 的计算成本。
+
+7.2 减少 expf 比减少 score_smem 更有效
+
+pcache 版本保留 score_smem，但将其复用为 probability cache，避免在不同输出维度上重复计算 expf，收益明显。
+
+7.3 Dispatch 需要按 shape 选择
+
+不同 S/BH/D 下最优 kernel 不同。小序列更适合轻量 BM4/BM8 vec4；中长序列更适合 BM16 pcache。
+
+8. File Structure
+attention_kernel.cu   CUDA kernels and launchers
+main.cu               Benchmark and correctness test
+README.md             Project documentation
+9. Build and Run
+rm -f attention_bench
+
+nvcc -O3 -std=c++17 -arch=sm_86 main.cu attention_kernel.cu -o attention_bench
+
+./attention_bench
+
+For RTX 4090, use:
+
+nvcc -O3 -std=c++17 -arch=sm_89 main.cu attention_kernel.cu -o attention_bench
+10. Current Best Result
+
+当前最佳版本为：
+
+BM16 regacc + float4 load + probability cache
+
+在 B=1,H=8,S=512,D=64 下：
+
+FlashAttention v1 = 0.9306 ms
+Final pcache      = 0.3344 ms
+Speedup           = 2.78x
+

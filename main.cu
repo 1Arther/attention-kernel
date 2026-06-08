@@ -226,6 +226,28 @@ void launch_flash_attention_skip_bm16_regacc_vec4(
     int D
 );
 
+// noscore v0: BM16 only
+void launch_flash_attention_skip_bm16_regacc_vec4_noscore(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+// pcache: BM16 only
+void launch_flash_attention_skip_bm16_regacc_vec4_pcache(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
 void attention_cpu_reference(
     const std::vector<float>& Q,
     const std::vector<float>& K,
@@ -709,7 +731,10 @@ void run_one_config(const AttnConfig& cfg) {
     CHECK_CUDA(cudaMemcpy(d_K, h_K.data(), qkv_bytes, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_V, h_V.data(), qkv_bytes, cudaMemcpyHostToDevice));
 
+    // ============================================================
     // correctness
+    // ============================================================
+
     launch_attention_forward(
         d_Q,
         d_K,
@@ -924,7 +949,38 @@ void run_one_config(const AttnConfig& cfg) {
         D
     );
 
+    float bm16_noscore_err = check_attention_launcher_correctness(
+        launch_flash_attention_skip_bm16_regacc_vec4_noscore,
+        h_ref,
+        h_out,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        qkv_bytes,
+        BH,
+        S,
+        D
+    );
+
+    float bm16_pcache_err = check_attention_launcher_correctness(
+        launch_flash_attention_skip_bm16_regacc_vec4_pcache,
+        h_ref,
+        h_out,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        qkv_bytes,
+        BH,
+        S,
+        D
+    );
+
+    // ============================================================
     // stage-wise timing
+    // ============================================================
+
     float qk_naive_ms = benchmark_qk(
         false,
         d_Q,
@@ -1001,7 +1057,10 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
+    // ============================================================
     // total timing
+    // ============================================================
+
     float total_naive_ms = benchmark_attention_total(
         false,
         d_Q,
@@ -1201,7 +1260,36 @@ void run_one_config(const AttnConfig& cfg) {
         cfg.repeat
     );
 
+    float bm16_noscore_ms = benchmark_attention_launcher(
+        launch_flash_attention_skip_bm16_regacc_vec4_noscore,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    float bm16_pcache_ms = benchmark_attention_launcher(
+        launch_flash_attention_skip_bm16_regacc_vec4_pcache,
+        d_Q,
+        d_K,
+        d_V,
+        d_O,
+        BH,
+        S,
+        D,
+        cfg.warmup,
+        cfg.repeat
+    );
+
+    // ============================================================
     // stats
+    // ============================================================
+
     double qk_speedup = qk_naive_ms / qk_tiled_ms;
     double pv_speedup = pv_naive_ms / pv_tiled_ms;
 
@@ -1217,6 +1305,9 @@ void run_one_config(const AttnConfig& cfg) {
     double vec4_4_vs_reg = bm4_reg_ms / bm4_vec4_ms;
     double vec4_8_vs_reg = bm8_reg_ms / bm8_vec4_ms;
     double vec4_16_vs_reg = bm16_reg_ms / bm16_vec4_ms;
+
+    double noscore_vs_vec4 = bm16_vec4_ms / bm16_noscore_ms;
+    double pcache_vs_vec4 = bm16_vec4_ms / bm16_pcache_ms;
 
     double score_mb = static_cast<double>(score_bytes) / 1024.0 / 1024.0;
     double qkv_mb = static_cast<double>(qkv_bytes) / 1024.0 / 1024.0;
@@ -1257,6 +1348,9 @@ void run_one_config(const AttnConfig& cfg) {
               << std::setw(12) << std::fixed << std::setprecision(4) << bm8_vec4_ms
               << std::setw(12) << std::fixed << std::setprecision(4) << bm16_vec4_ms
 
+              << std::setw(14) << std::fixed << std::setprecision(4) << bm16_noscore_ms
+              << std::setw(14) << std::fixed << std::setprecision(4) << bm16_pcache_ms
+
               << std::setw(12) << std::fixed << std::setprecision(3) << tiled_speedup
               << std::setw(12) << std::fixed << std::setprecision(3) << flash_vs_naive
               << std::setw(12) << std::fixed << std::setprecision(3) << skip_vs_flash
@@ -1269,6 +1363,9 @@ void run_one_config(const AttnConfig& cfg) {
               << std::setw(12) << std::fixed << std::setprecision(3) << vec4_4_vs_reg
               << std::setw(12) << std::fixed << std::setprecision(3) << vec4_8_vs_reg
               << std::setw(12) << std::fixed << std::setprecision(3) << vec4_16_vs_reg
+
+              << std::setw(14) << std::fixed << std::setprecision(3) << noscore_vs_vec4
+              << std::setw(14) << std::fixed << std::setprecision(3) << pcache_vs_vec4
 
               << std::setw(10) << std::fixed << std::setprecision(2) << score_mb
               << std::setw(10) << std::fixed << std::setprecision(2) << qkv_mb
@@ -1291,6 +1388,9 @@ void run_one_config(const AttnConfig& cfg) {
               << std::setw(12) << std::scientific << std::setprecision(2) << bm4_vec4_err
               << std::setw(12) << std::scientific << std::setprecision(2) << bm8_vec4_err
               << std::setw(12) << std::scientific << std::setprecision(2) << bm16_vec4_err
+
+              << std::setw(12) << std::scientific << std::setprecision(2) << bm16_noscore_err
+              << std::setw(12) << std::scientific << std::setprecision(2) << bm16_pcache_err
               << "\n";
 
     CHECK_CUDA(cudaFree(d_Q));
@@ -1315,7 +1415,7 @@ int main() {
     std::cout << "Device: " << prop.name << "\n";
     std::cout << "SM count: " << prop.multiProcessorCount << "\n\n";
 
-    std::cout << "=== Causal Attention Forward: smem vs regacc vs regacc_vec4 ===\n";
+    std::cout << "=== Causal Attention Forward: smem vs regacc vs vec4 vs BM16 noscore/pcache ===\n";
 
     std::cout << std::left
               << std::setw(6) << "B"
@@ -1353,6 +1453,9 @@ int main() {
               << std::setw(12) << "bm8_vec4"
               << std::setw(12) << "bm16_vec4"
 
+              << std::setw(14) << "bm16_noscore"
+              << std::setw(14) << "bm16_pcache"
+
               << std::setw(12) << "tiled_spd"
               << std::setw(12) << "flash_spd"
               << std::setw(12) << "skip/flash"
@@ -1365,6 +1468,9 @@ int main() {
               << std::setw(12) << "v4/reg4"
               << std::setw(12) << "v4/reg8"
               << std::setw(12) << "v4/reg16"
+
+              << std::setw(14) << "noscore/v4"
+              << std::setw(14) << "pcache/v4"
 
               << std::setw(10) << "score_MB"
               << std::setw(10) << "qkv_MB"
@@ -1387,6 +1493,9 @@ int main() {
               << std::setw(12) << "bm4v_err"
               << std::setw(12) << "bm8v_err"
               << std::setw(12) << "bm16v_err"
+
+              << std::setw(12) << "bm16n_err"
+              << std::setw(12) << "bm16p_err"
               << "\n";
 
     std::vector<AttnConfig> configs = {
