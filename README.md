@@ -365,3 +365,30 @@ if (S >= 512 && D <= 64) {
 }
 
 该策略避免了小序列下 regacc 变慢的问题，同时保留长序列下 register accumulator 的收益。
+
+## Float4 Vectorized Load
+
+在 register-accumulator FlashAttention 版本基础上，进一步加入了 `float4` 向量化加载，用于优化 Q/K/V 从 global memory 到 shared memory 的搬运。当 `D % 4 == 0` 时，kernel 使用 `float4` 一次读取 4 个连续 float；否则回退到 scalar load。
+
+该优化不改变 attention 计算逻辑，只优化 Q/K/V tile load 路径。
+
+实验结果显示，`float4` 对 regacc 版本有稳定收益。以 `B=1,H=8,S=512,D=64` 为例：
+
+```text
+FlashAttention v1        = 0.9302 ms
+Regacc dispatch          = 0.5183 ms
+Regacc + float4 dispatch = 0.4626 ms
+
+相较原始 FlashAttention v1，最终版本达到约 2.01x 加速；相较 regacc scalar-load 版本，float4 进一步带来约 1.12x 加速。
+
+最终 dispatch 策略为：
+
+if (S >= 512 && D <= 64) {
+    use BM16 regacc vec4;
+} else if (S >= 256) {
+    use BM8 regacc vec4;
+} else {
+    use BM4 regacc vec4;
+}
+
+所有版本误差均保持在 1e-7 量级。
