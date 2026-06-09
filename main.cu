@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -24,6 +25,46 @@
 // launcher declarations from attention_kernel.cu
 // ============================================================
 
+// unfused: QK + softmax + PV
+// 注意：这个版本需要 d_scores / d_probs workspace
+void launch_attention_forward(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_scores,
+    float* d_probs,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+// tiled QK/PV + softmax
+// 注意：这个版本也需要 d_scores / d_probs workspace
+void launch_attention_forward_tiled(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_scores,
+    float* d_probs,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+// fused row attention
+void launch_attention_forward_fused_row(
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+);
+
+// FlashAttention v1 baseline
 void launch_flash_attention_v1(
     const float* d_Q,
     const float* d_K,
@@ -34,6 +75,7 @@ void launch_flash_attention_v1(
     int D
 );
 
+// final dispatch：你现在应该让它内部走 padding pcache
 void launch_flash_attention_causal_tile_skipping(
     const float* d_Q,
     const float* d_K,
@@ -44,7 +86,8 @@ void launch_flash_attention_causal_tile_skipping(
     int D
 );
 
-void launch_flash_attention_causal_tile_skipping_vec4(
+// padding dispatch：用于确认和 final 是否一致
+void launch_flash_attention_causal_tile_skipping_pcache_padding(
     const float* d_Q,
     const float* d_K,
     const float* d_V,
@@ -54,8 +97,8 @@ void launch_flash_attention_causal_tile_skipping_vec4(
     int D
 );
 
-// regacc + float4 baseline
-void launch_flash_attention_skip_bm4_regacc_vec4(
+// BM4/BM8/BM16 padding pcache
+void launch_flash_attention_skip_bm4_regacc_vec4_pcache_padding(
     const float* d_Q,
     const float* d_K,
     const float* d_V,
@@ -65,7 +108,7 @@ void launch_flash_attention_skip_bm4_regacc_vec4(
     int D
 );
 
-void launch_flash_attention_skip_bm8_regacc_vec4(
+void launch_flash_attention_skip_bm8_regacc_vec4_pcache_padding(
     const float* d_Q,
     const float* d_K,
     const float* d_V,
@@ -75,59 +118,18 @@ void launch_flash_attention_skip_bm8_regacc_vec4(
     int D
 );
 
-void launch_flash_attention_skip_bm16_regacc_vec4(
+void launch_flash_attention_skip_bm16_regacc_vec4_pcache_padding(
     const float* d_Q,
     const float* d_K,
     const float* d_V,
     float* d_O,
-    int BH,
-    int S,
-    int D
-);
-
-// regacc + float4 + pcache
-void launch_flash_attention_skip_bm4_regacc_vec4_pcache(
-    const float* d_Q,
-    const float* d_K,
-    const float* d_V,
-    float* d_O,
-    int BH,
-    int S,
-    int D
-);
-
-void launch_flash_attention_skip_bm8_regacc_vec4_pcache(
-    const float* d_Q,
-    const float* d_K,
-    const float* d_V,
-    float* d_O,
-    int BH,
-    int S,
-    int D
-);
-
-void launch_flash_attention_skip_bm16_regacc_vec4_pcache(
-    const float* d_Q,
-    const float* d_K,
-    const float* d_V,
-    float* d_O,
-    int BH,
-    int S,
-    int D
-);
-
-void attention_cpu_reference(
-    const std::vector<float>& Q,
-    const std::vector<float>& K,
-    const std::vector<float>& V,
-    std::vector<float>& O,
     int BH,
     int S,
     int D
 );
 
 // ============================================================
-// types
+// config / kernel enum
 // ============================================================
 
 struct AttnConfig {
@@ -139,15 +141,90 @@ struct AttnConfig {
     int repeat;
 };
 
-using AttentionLauncher = void (*)(
-    const float*,
-    const float*,
-    const float*,
-    float*,
-    int,
-    int,
-    int
-);
+enum class KernelKind {
+    Unfused,
+    Tiled,
+    FusedRow,
+    FlashV1,
+    Final,
+    PadDispatch,
+    BM4Pad,
+    BM8Pad,
+    BM16Pad
+};
+
+struct KernelSpec {
+    std::string name;
+    KernelKind kind;
+};
+
+struct KernelResult {
+    std::string name;
+    float ms;
+    float err;
+};
+
+// ============================================================
+// CPU reference
+// layout:
+// Q/K/V/O: [BH, S, D]
+// causal attention:
+// O[q] = softmax(Q[q] K[0:q]^T / sqrt(D)) V[0:q]
+// ============================================================
+
+void attention_cpu_reference_local(
+    const std::vector<float>& Q,
+    const std::vector<float>& K,
+    const std::vector<float>& V,
+    std::vector<float>& O,
+    int BH,
+    int S,
+    int D
+) {
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+
+    std::fill(O.begin(), O.end(), 0.0f);
+
+    std::vector<float> scores(S, 0.0f);
+
+    for (int bh = 0; bh < BH; ++bh) {
+        const int base = bh * S * D;
+
+        for (int q = 0; q < S; ++q) {
+            float max_score = -std::numeric_limits<float>::infinity();
+
+            for (int k = 0; k <= q; ++k) {
+                float dot = 0.0f;
+
+                for (int d = 0; d < D; ++d) {
+                    dot += Q[base + q * D + d] * K[base + k * D + d];
+                }
+
+                float score = dot * scale;
+                scores[k] = score;
+                max_score = std::max(max_score, score);
+            }
+
+            float denom = 0.0f;
+
+            for (int k = 0; k <= q; ++k) {
+                scores[k] = std::exp(scores[k] - max_score);
+                denom += scores[k];
+            }
+
+            for (int d = 0; d < D; ++d) {
+                float acc = 0.0f;
+
+                for (int k = 0; k <= q; ++k) {
+                    float p = scores[k] / denom;
+                    acc += p * V[base + k * D + d];
+                }
+
+                O[base + q * D + d] = acc;
+            }
+        }
+    }
+}
 
 // ============================================================
 // helper functions
@@ -166,47 +243,199 @@ float max_abs_error(
     return err;
 }
 
+void call_kernel(
+    KernelKind kind,
+    const float* d_Q,
+    const float* d_K,
+    const float* d_V,
+    float* d_scores,
+    float* d_probs,
+    float* d_O,
+    int BH,
+    int S,
+    int D
+) {
+    switch (kind) {
+        case KernelKind::Unfused:
+            launch_attention_forward(
+                d_Q,
+                d_K,
+                d_V,
+                d_scores,
+                d_probs,
+                d_O,
+                BH,
+                S,
+                D
+            );
+            break;
+
+        case KernelKind::Tiled:
+            launch_attention_forward_tiled(
+                d_Q,
+                d_K,
+                d_V,
+                d_scores,
+                d_probs,
+                d_O,
+                BH,
+                S,
+                D
+            );
+            break;
+
+        case KernelKind::FusedRow:
+            launch_attention_forward_fused_row(
+                d_Q,
+                d_K,
+                d_V,
+                d_O,
+                BH,
+                S,
+                D
+            );
+            break;
+
+        case KernelKind::FlashV1:
+            launch_flash_attention_v1(
+                d_Q,
+                d_K,
+                d_V,
+                d_O,
+                BH,
+                S,
+                D
+            );
+            break;
+
+        case KernelKind::Final:
+            launch_flash_attention_causal_tile_skipping(
+                d_Q,
+                d_K,
+                d_V,
+                d_O,
+                BH,
+                S,
+                D
+            );
+            break;
+
+        case KernelKind::PadDispatch:
+            launch_flash_attention_causal_tile_skipping_pcache_padding(
+                d_Q,
+                d_K,
+                d_V,
+                d_O,
+                BH,
+                S,
+                D
+            );
+            break;
+
+        case KernelKind::BM4Pad:
+            launch_flash_attention_skip_bm4_regacc_vec4_pcache_padding(
+                d_Q,
+                d_K,
+                d_V,
+                d_O,
+                BH,
+                S,
+                D
+            );
+            break;
+
+        case KernelKind::BM8Pad:
+            launch_flash_attention_skip_bm8_regacc_vec4_pcache_padding(
+                d_Q,
+                d_K,
+                d_V,
+                d_O,
+                BH,
+                S,
+                D
+            );
+            break;
+
+        case KernelKind::BM16Pad:
+            launch_flash_attention_skip_bm16_regacc_vec4_pcache_padding(
+                d_Q,
+                d_K,
+                d_V,
+                d_O,
+                BH,
+                S,
+                D
+            );
+            break;
+    }
+}
+
 float check_correctness(
-    AttentionLauncher launcher,
+    const KernelSpec& spec,
     const std::vector<float>& h_ref,
     std::vector<float>& h_out,
     const float* d_Q,
     const float* d_K,
     const float* d_V,
+    float* d_scores,
+    float* d_probs,
     float* d_O,
-    size_t bytes,
+    size_t out_bytes,
+    size_t scores_bytes,
     int BH,
     int S,
     int D
 ) {
-    launcher(
+    CHECK_CUDA(cudaMemset(d_O, 0, out_bytes));
+
+    if (d_scores != nullptr) {
+        CHECK_CUDA(cudaMemset(d_scores, 0, scores_bytes));
+    }
+
+    if (d_probs != nullptr) {
+        CHECK_CUDA(cudaMemset(d_probs, 0, scores_bytes));
+    }
+
+    call_kernel(
+        spec.kind,
         d_Q,
         d_K,
         d_V,
+        d_scores,
+        d_probs,
         d_O,
         BH,
         S,
         D
     );
 
-    CHECK_CUDA(cudaGetLastError());
+    cudaError_t kernel_err = cudaGetLastError();
+
+    if (kernel_err != cudaSuccess) {
+        std::cerr << "Kernel launch failed for " << spec.name
+                  << ": " << cudaGetErrorString(kernel_err) << std::endl;
+        return std::numeric_limits<float>::infinity();
+    }
+
     CHECK_CUDA(cudaDeviceSynchronize());
 
     CHECK_CUDA(cudaMemcpy(
         h_out.data(),
         d_O,
-        bytes,
+        out_bytes,
         cudaMemcpyDeviceToHost
     ));
 
     return max_abs_error(h_ref, h_out);
 }
 
-float benchmark_launcher(
-    AttentionLauncher launcher,
+float benchmark_kernel(
+    const KernelSpec& spec,
     const float* d_Q,
     const float* d_K,
     const float* d_V,
+    float* d_scores,
+    float* d_probs,
     float* d_O,
     int BH,
     int S,
@@ -215,10 +444,13 @@ float benchmark_launcher(
     int repeat
 ) {
     for (int i = 0; i < warmup; ++i) {
-        launcher(
+        call_kernel(
+            spec.kind,
             d_Q,
             d_K,
             d_V,
+            d_scores,
+            d_probs,
             d_O,
             BH,
             S,
@@ -226,7 +458,14 @@ float benchmark_launcher(
         );
     }
 
-    CHECK_CUDA(cudaGetLastError());
+    cudaError_t kernel_err = cudaGetLastError();
+
+    if (kernel_err != cudaSuccess) {
+        std::cerr << "Warmup failed for " << spec.name
+                  << ": " << cudaGetErrorString(kernel_err) << std::endl;
+        return std::numeric_limits<float>::infinity();
+    }
+
     CHECK_CUDA(cudaDeviceSynchronize());
 
     cudaEvent_t start;
@@ -238,10 +477,13 @@ float benchmark_launcher(
     CHECK_CUDA(cudaEventRecord(start));
 
     for (int i = 0; i < repeat; ++i) {
-        launcher(
+        call_kernel(
+            spec.kind,
             d_Q,
             d_K,
             d_V,
+            d_scores,
+            d_probs,
             d_O,
             BH,
             S,
@@ -258,10 +500,27 @@ float benchmark_launcher(
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
 
-    CHECK_CUDA(cudaGetLastError());
+    kernel_err = cudaGetLastError();
+
+    if (kernel_err != cudaSuccess) {
+        std::cerr << "Benchmark failed for " << spec.name
+                  << ": " << cudaGetErrorString(kernel_err) << std::endl;
+        return std::numeric_limits<float>::infinity();
+    }
+
     CHECK_CUDA(cudaDeviceSynchronize());
 
     return total_ms / static_cast<float>(repeat);
+}
+
+double speedup(float baseline_ms, float target_ms) {
+    if (!std::isfinite(baseline_ms) ||
+        !std::isfinite(target_ms) ||
+        target_ms <= 0.0f) {
+        return 0.0;
+    }
+
+    return static_cast<double>(baseline_ms) / static_cast<double>(target_ms);
 }
 
 // ============================================================
@@ -277,6 +536,9 @@ void run_one_config(const AttnConfig& cfg) {
 
     size_t qkv_elems = static_cast<size_t>(BH) * S * D;
     size_t qkv_bytes = qkv_elems * sizeof(float);
+
+    size_t score_elems = static_cast<size_t>(BH) * S * S;
+    size_t score_bytes = score_elems * sizeof(float);
 
     std::vector<float> h_Q(qkv_elems);
     std::vector<float> h_K(qkv_elems);
@@ -300,7 +562,7 @@ void run_one_config(const AttnConfig& cfg) {
         x = dist(gen);
     }
 
-    attention_cpu_reference(
+    attention_cpu_reference_local(
         h_Q,
         h_K,
         h_V,
@@ -315,299 +577,119 @@ void run_one_config(const AttnConfig& cfg) {
     float* d_V = nullptr;
     float* d_O = nullptr;
 
+    float* d_scores = nullptr;
+    float* d_probs = nullptr;
+
     CHECK_CUDA(cudaMalloc(&d_Q, qkv_bytes));
     CHECK_CUDA(cudaMalloc(&d_K, qkv_bytes));
     CHECK_CUDA(cudaMalloc(&d_V, qkv_bytes));
     CHECK_CUDA(cudaMalloc(&d_O, qkv_bytes));
 
+    CHECK_CUDA(cudaMalloc(&d_scores, score_bytes));
+    CHECK_CUDA(cudaMalloc(&d_probs, score_bytes));
+
     CHECK_CUDA(cudaMemcpy(d_Q, h_Q.data(), qkv_bytes, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_K, h_K.data(), qkv_bytes, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_V, h_V.data(), qkv_bytes, cudaMemcpyHostToDevice));
 
-    // ============================================================
-    // correctness
-    // ============================================================
+    std::vector<KernelSpec> kernels = {
+        {"unfused",      KernelKind::Unfused},
+        {"tiled",        KernelKind::Tiled},
+        {"fused_row",    KernelKind::FusedRow},
+        {"flash_v1",     KernelKind::FlashV1},
+        {"final",        KernelKind::Final},
+        {"pad_dispatch", KernelKind::PadDispatch},
+        {"bm4_pad",      KernelKind::BM4Pad},
+        {"bm8_pad",      KernelKind::BM8Pad},
+        {"bm16_pad",     KernelKind::BM16Pad}
+    };
 
-    float flash_err = check_correctness(
-        launch_flash_attention_v1,
-        h_ref,
-        h_out,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        qkv_bytes,
-        BH,
-        S,
-        D
-    );
+    std::vector<KernelResult> results;
+    results.reserve(kernels.size());
 
-    float dispatch_err = check_correctness(
-        launch_flash_attention_causal_tile_skipping,
-        h_ref,
-        h_out,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        qkv_bytes,
-        BH,
-        S,
-        D
-    );
+    for (const auto& spec : kernels) {
+        float err = check_correctness(
+            spec,
+            h_ref,
+            h_out,
+            d_Q,
+            d_K,
+            d_V,
+            d_scores,
+            d_probs,
+            d_O,
+            qkv_bytes,
+            score_bytes,
+            BH,
+            S,
+            D
+        );
 
-    float dispatch_vec4_err = check_correctness(
-        launch_flash_attention_causal_tile_skipping_vec4,
-        h_ref,
-        h_out,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        qkv_bytes,
-        BH,
-        S,
-        D
-    );
+        float ms = benchmark_kernel(
+            spec,
+            d_Q,
+            d_K,
+            d_V,
+            d_scores,
+            d_probs,
+            d_O,
+            BH,
+            S,
+            D,
+            cfg.warmup,
+            cfg.repeat
+        );
 
-    float bm4_vec4_err = check_correctness(
-        launch_flash_attention_skip_bm4_regacc_vec4,
-        h_ref,
-        h_out,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        qkv_bytes,
-        BH,
-        S,
-        D
-    );
-
-    float bm8_vec4_err = check_correctness(
-        launch_flash_attention_skip_bm8_regacc_vec4,
-        h_ref,
-        h_out,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        qkv_bytes,
-        BH,
-        S,
-        D
-    );
-
-    float bm16_vec4_err = check_correctness(
-        launch_flash_attention_skip_bm16_regacc_vec4,
-        h_ref,
-        h_out,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        qkv_bytes,
-        BH,
-        S,
-        D
-    );
-
-    float bm4_pcache_err = check_correctness(
-        launch_flash_attention_skip_bm4_regacc_vec4_pcache,
-        h_ref,
-        h_out,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        qkv_bytes,
-        BH,
-        S,
-        D
-    );
-
-    float bm8_pcache_err = check_correctness(
-        launch_flash_attention_skip_bm8_regacc_vec4_pcache,
-        h_ref,
-        h_out,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        qkv_bytes,
-        BH,
-        S,
-        D
-    );
-
-    float bm16_pcache_err = check_correctness(
-        launch_flash_attention_skip_bm16_regacc_vec4_pcache,
-        h_ref,
-        h_out,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        qkv_bytes,
-        BH,
-        S,
-        D
-    );
-
-    // ============================================================
-    // timing
-    // ============================================================
-
-    float flash_ms = benchmark_launcher(
-        launch_flash_attention_v1,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        BH,
-        S,
-        D,
-        cfg.warmup,
-        cfg.repeat
-    );
-
-    float dispatch_ms = benchmark_launcher(
-        launch_flash_attention_causal_tile_skipping,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        BH,
-        S,
-        D,
-        cfg.warmup,
-        cfg.repeat
-    );
-
-    float dispatch_vec4_ms = benchmark_launcher(
-        launch_flash_attention_causal_tile_skipping_vec4,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        BH,
-        S,
-        D,
-        cfg.warmup,
-        cfg.repeat
-    );
-
-    float bm4_vec4_ms = benchmark_launcher(
-        launch_flash_attention_skip_bm4_regacc_vec4,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        BH,
-        S,
-        D,
-        cfg.warmup,
-        cfg.repeat
-    );
-
-    float bm8_vec4_ms = benchmark_launcher(
-        launch_flash_attention_skip_bm8_regacc_vec4,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        BH,
-        S,
-        D,
-        cfg.warmup,
-        cfg.repeat
-    );
-
-    float bm16_vec4_ms = benchmark_launcher(
-        launch_flash_attention_skip_bm16_regacc_vec4,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        BH,
-        S,
-        D,
-        cfg.warmup,
-        cfg.repeat
-    );
-
-    float bm4_pcache_ms = benchmark_launcher(
-        launch_flash_attention_skip_bm4_regacc_vec4_pcache,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        BH,
-        S,
-        D,
-        cfg.warmup,
-        cfg.repeat
-    );
-
-    float bm8_pcache_ms = benchmark_launcher(
-        launch_flash_attention_skip_bm8_regacc_vec4_pcache,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        BH,
-        S,
-        D,
-        cfg.warmup,
-        cfg.repeat
-    );
-
-    float bm16_pcache_ms = benchmark_launcher(
-        launch_flash_attention_skip_bm16_regacc_vec4_pcache,
-        d_Q,
-        d_K,
-        d_V,
-        d_O,
-        BH,
-        S,
-        D,
-        cfg.warmup,
-        cfg.repeat
-    );
-
-    // ============================================================
-    // stats
-    // ============================================================
-
-    double dispatch_vs_flash = flash_ms / dispatch_ms;
-    double vec4_dispatch_vs_flash = flash_ms / dispatch_vec4_ms;
-
-    double pc4_vs_v4 = bm4_vec4_ms / bm4_pcache_ms;
-    double pc8_vs_v4 = bm8_vec4_ms / bm8_pcache_ms;
-    double pc16_vs_v4 = bm16_vec4_ms / bm16_pcache_ms;
-
-    double bm4_pc_vs_flash = flash_ms / bm4_pcache_ms;
-    double bm8_pc_vs_flash = flash_ms / bm8_pcache_ms;
-    double bm16_pc_vs_flash = flash_ms / bm16_pcache_ms;
-
-    std::string best_name = "bm4_pcache";
-    float best_ms = bm4_pcache_ms;
-
-    if (bm8_pcache_ms < best_ms) {
-        best_ms = bm8_pcache_ms;
-        best_name = "bm8_pcache";
+        results.push_back({spec.name, ms, err});
     }
 
-    if (bm16_pcache_ms < best_ms) {
-        best_ms = bm16_pcache_ms;
-        best_name = "bm16_pcache";
+    auto get_ms = [&](const std::string& name) -> float {
+        for (const auto& r : results) {
+            if (r.name == name) {
+                return r.ms;
+            }
+        }
+
+        return std::numeric_limits<float>::infinity();
+    };
+
+    auto get_err = [&](const std::string& name) -> float {
+        for (const auto& r : results) {
+            if (r.name == name) {
+                return r.err;
+            }
+        }
+
+        return std::numeric_limits<float>::infinity();
+    };
+
+    float unfused_ms = get_ms("unfused");
+    float tiled_ms = get_ms("tiled");
+    float fused_row_ms = get_ms("fused_row");
+    float flash_ms = get_ms("flash_v1");
+    float final_ms = get_ms("final");
+    float pad_dispatch_ms = get_ms("pad_dispatch");
+    float bm4_pad_ms = get_ms("bm4_pad");
+    float bm8_pad_ms = get_ms("bm8_pad");
+    float bm16_pad_ms = get_ms("bm16_pad");
+
+    float unfused_err = get_err("unfused");
+    float tiled_err = get_err("tiled");
+    float fused_row_err = get_err("fused_row");
+    float flash_err = get_err("flash_v1");
+    float final_err = get_err("final");
+    float pad_dispatch_err = get_err("pad_dispatch");
+    float bm4_pad_err = get_err("bm4_pad");
+    float bm8_pad_err = get_err("bm8_pad");
+    float bm16_pad_err = get_err("bm16_pad");
+
+    KernelResult best = results[0];
+
+    for (const auto& r : results) {
+        if (r.ms < best.ms) {
+            best = r;
+        }
     }
-
-    double best_vs_flash = flash_ms / best_ms;
-
-    // ============================================================
-    // print
-    // ============================================================
 
     std::cout << std::left
               << std::setw(5) << B
@@ -616,50 +698,43 @@ void run_one_config(const AttnConfig& cfg) {
               << std::setw(6) << S
               << std::setw(5) << D
 
+              << std::setw(11) << std::fixed << std::setprecision(4) << unfused_ms
+              << std::setw(11) << std::fixed << std::setprecision(4) << tiled_ms
+              << std::setw(12) << std::fixed << std::setprecision(4) << fused_row_ms
               << std::setw(11) << std::fixed << std::setprecision(4) << flash_ms
-              << std::setw(11) << std::fixed << std::setprecision(4) << dispatch_ms
-              << std::setw(11) << std::fixed << std::setprecision(4) << dispatch_vec4_ms
+              << std::setw(11) << std::fixed << std::setprecision(4) << final_ms
+              << std::setw(13) << std::fixed << std::setprecision(4) << pad_dispatch_ms
 
-              << std::setw(11) << std::fixed << std::setprecision(4) << bm4_vec4_ms
-              << std::setw(11) << std::fixed << std::setprecision(4) << bm8_vec4_ms
-              << std::setw(11) << std::fixed << std::setprecision(4) << bm16_vec4_ms
+              << std::setw(11) << std::fixed << std::setprecision(4) << bm4_pad_ms
+              << std::setw(11) << std::fixed << std::setprecision(4) << bm8_pad_ms
+              << std::setw(11) << std::fixed << std::setprecision(4) << bm16_pad_ms
 
-              << std::setw(12) << std::fixed << std::setprecision(4) << bm4_pcache_ms
-              << std::setw(12) << std::fixed << std::setprecision(4) << bm8_pcache_ms
-              << std::setw(12) << std::fixed << std::setprecision(4) << bm16_pcache_ms
+              << std::setw(12) << std::fixed << std::setprecision(3) << speedup(unfused_ms, final_ms)
+              << std::setw(11) << std::fixed << std::setprecision(3) << speedup(flash_ms, final_ms)
+              << std::setw(13) << std::fixed << std::setprecision(3) << speedup(tiled_ms, final_ms)
+              << std::setw(13) << std::fixed << std::setprecision(3) << speedup(fused_row_ms, final_ms)
 
-              << std::setw(10) << std::fixed << std::setprecision(3) << dispatch_vs_flash
-              << std::setw(10) << std::fixed << std::setprecision(3) << vec4_dispatch_vs_flash
+              << std::setw(13) << best.name
+              << std::setw(10) << std::fixed << std::setprecision(4) << best.ms
 
-              << std::setw(9) << std::fixed << std::setprecision(3) << pc4_vs_v4
-              << std::setw(9) << std::fixed << std::setprecision(3) << pc8_vs_v4
-              << std::setw(10) << std::fixed << std::setprecision(3) << pc16_vs_v4
-
-              << std::setw(10) << std::fixed << std::setprecision(3) << bm4_pc_vs_flash
-              << std::setw(10) << std::fixed << std::setprecision(3) << bm8_pc_vs_flash
-              << std::setw(11) << std::fixed << std::setprecision(3) << bm16_pc_vs_flash
-
-              << std::setw(14) << best_name
-              << std::setw(10) << std::fixed << std::setprecision(4) << best_ms
-              << std::setw(11) << std::fixed << std::setprecision(3) << best_vs_flash
-
+              << std::setw(12) << std::scientific << std::setprecision(2) << unfused_err
+              << std::setw(11) << std::scientific << std::setprecision(2) << tiled_err
+              << std::setw(12) << std::scientific << std::setprecision(2) << fused_row_err
               << std::setw(11) << std::scientific << std::setprecision(2) << flash_err
-              << std::setw(11) << std::scientific << std::setprecision(2) << dispatch_err
-              << std::setw(11) << std::scientific << std::setprecision(2) << dispatch_vec4_err
-
-              << std::setw(11) << std::scientific << std::setprecision(2) << bm4_vec4_err
-              << std::setw(11) << std::scientific << std::setprecision(2) << bm8_vec4_err
-              << std::setw(11) << std::scientific << std::setprecision(2) << bm16_vec4_err
-
-              << std::setw(11) << std::scientific << std::setprecision(2) << bm4_pcache_err
-              << std::setw(11) << std::scientific << std::setprecision(2) << bm8_pcache_err
-              << std::setw(11) << std::scientific << std::setprecision(2) << bm16_pcache_err
+              << std::setw(11) << std::scientific << std::setprecision(2) << final_err
+              << std::setw(13) << std::scientific << std::setprecision(2) << pad_dispatch_err
+              << std::setw(12) << std::scientific << std::setprecision(2) << bm4_pad_err
+              << std::setw(12) << std::scientific << std::setprecision(2) << bm8_pad_err
+              << std::setw(13) << std::scientific << std::setprecision(2) << bm16_pad_err
               << "\n";
 
     CHECK_CUDA(cudaFree(d_Q));
     CHECK_CUDA(cudaFree(d_K));
     CHECK_CUDA(cudaFree(d_V));
     CHECK_CUDA(cudaFree(d_O));
+
+    CHECK_CUDA(cudaFree(d_scores));
+    CHECK_CUDA(cudaFree(d_probs));
 }
 
 // ============================================================
@@ -676,7 +751,7 @@ int main() {
     std::cout << "Device: " << prop.name << "\n";
     std::cout << "SM count: " << prop.multiProcessorCount << "\n\n";
 
-    std::cout << "=== Causal Attention Forward: BM4/BM8/BM16 pcache dispatch benchmark ===\n";
+    std::cout << "=== Causal Attention Forward: unfused vs optimized padding dispatch ===\n";
 
     std::cout << std::left
               << std::setw(5) << "B"
@@ -685,44 +760,34 @@ int main() {
               << std::setw(6) << "S"
               << std::setw(5) << "D"
 
-              << std::setw(11) << "flash"
-              << std::setw(11) << "dispatch"
-              << std::setw(11) << "disp_v4"
+              << std::setw(11) << "unfused"
+              << std::setw(11) << "tiled"
+              << std::setw(12) << "fused_row"
+              << std::setw(11) << "flash_v1"
+              << std::setw(11) << "final"
+              << std::setw(13) << "pad_dispatch"
 
-              << std::setw(11) << "bm4_v4"
-              << std::setw(11) << "bm8_v4"
-              << std::setw(11) << "bm16_v4"
+              << std::setw(11) << "bm4_pad"
+              << std::setw(11) << "bm8_pad"
+              << std::setw(11) << "bm16_pad"
 
-              << std::setw(12) << "bm4_pc"
-              << std::setw(12) << "bm8_pc"
-              << std::setw(12) << "bm16_pc"
+              << std::setw(12) << "unf/final"
+              << std::setw(11) << "fl/final"
+              << std::setw(13) << "tiled/final"
+              << std::setw(13) << "fused/final"
 
-              << std::setw(10) << "disp/fl"
-              << std::setw(10) << "v4/fl"
-
-              << std::setw(9) << "pc4/v4"
-              << std::setw(9) << "pc8/v4"
-              << std::setw(10) << "pc16/v4"
-
-              << std::setw(10) << "pc4/fl"
-              << std::setw(10) << "pc8/fl"
-              << std::setw(11) << "pc16/fl"
-
-              << std::setw(14) << "best"
+              << std::setw(13) << "best"
               << std::setw(10) << "best_ms"
-              << std::setw(11) << "best/fl"
 
+              << std::setw(12) << "unf_err"
+              << std::setw(11) << "tiled_err"
+              << std::setw(12) << "fused_err"
               << std::setw(11) << "flash_err"
-              << std::setw(11) << "disp_err"
-              << std::setw(11) << "v4d_err"
-
-              << std::setw(11) << "bm4v_err"
-              << std::setw(11) << "bm8v_err"
-              << std::setw(11) << "bm16v_err"
-
-              << std::setw(11) << "bm4p_err"
-              << std::setw(11) << "bm8p_err"
-              << std::setw(11) << "bm16p_err"
+              << std::setw(11) << "final_err"
+              << std::setw(13) << "pad_disp_err"
+              << std::setw(12) << "bm4pad_err"
+              << std::setw(12) << "bm8pad_err"
+              << std::setw(13) << "bm16pad_err"
               << "\n";
 
     std::vector<AttnConfig> configs = {

@@ -310,3 +310,42 @@ FlashAttention v1 = 0.9306 ms
 Final pcache      = 0.3344 ms
 Speedup           = 2.78x
 
+## 最终性能对比
+
+本项目实现了多种 causal attention 前向计算方式，包括：
+
+1. `unfused`：传统三阶段实现，依次执行 `QK^T`、causal softmax 和 `PV`。
+2. `tiled`：对 `QK^T` 和 `PV` 引入 shared memory tiling。
+3. `fused_row`：一个 block 负责一行 query，融合 QK、softmax 和 PV。
+4. `FlashAttention v1`：基于 online softmax 的基础 FlashAttention 实现。
+5. `final`：最终优化版本，采用 causal tile skipping、register accumulator、float4 向量化加载、probability cache，以及 shared memory padding。
+
+最终版本的核心优化是对 shared memory 进行 padding：
+
+```cpp
+constexpr int SMEM_D = MAX_D + 1;
+
+__shared__ float q_smem[BLOCK_M][SMEM_D];
+__shared__ float k_smem[BLOCK_N][SMEM_D];
+__shared__ float v_smem[BLOCK_N][SMEM_D];
+
+在 D=64 时，原始 shared memory 行跨度为 64，容易在按列访问 K/V tile 时产生严重 bank conflict。将行跨度改为 65 后，可以显著缓解 bank conflict。
+
+NVIDIA A40 测试结果
+Shape	unfused	tiled	fused_row	FlashAttention v1	final	final / unfused	final / Flash v1	最快版本
+B=1,H=1,S=64,D=64	0.0196 ms	0.0103 ms	0.0076 ms	0.0186 ms	0.0120 ms	1.63x	1.55x	fused_row
+B=1,H=1,S=128,D=64	0.0223 ms	0.0125 ms	0.0124 ms	0.0346 ms	0.0214 ms	1.04x	1.62x	fused_row
+B=1,H=8,S=128,D=64	0.0916 ms	0.0280 ms	0.0512 ms	0.0789 ms	0.0330 ms	2.78x	2.40x	tiled
+B=1,H=8,S=256,D=64	0.3018 ms	0.0729 ms	0.1593 ms	0.2611 ms	0.0891 ms	3.39x	2.93x	tiled
+B=1,H=8,S=512,D=64	1.1393 ms	0.2481 ms	0.5646 ms	0.9305 ms	0.2288 ms	4.98x	4.07x	final
+
+可以看到，最终 FlashAttention 优化版本在所有测试 shape 下均快于 unfused baseline，并且在长序列场景下优势最明显。在 B=1,H=8,S=512,D=64 下，final 版本相比 unfused 获得约 4.98x 加速，相比基础 FlashAttention v1 获得约 4.07x 加速。
+
+同时，小规模 shape 下 fused_row 或 tiled 仍然可能更快。这是因为小序列长度下 FlashAttention 的 block 级调度、shared memory 和同步开销尚未被充分摊薄；而在长序列场景下，final 版本通过 tile skipping、online softmax、probability cache 和 shared memory padding 显著减少了冗余计算和访存开销。
+
+
+---
+
+## 4. 结论该怎么说最稳
+
+你可以在项目 README 里这样总结：
