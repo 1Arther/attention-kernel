@@ -2140,7 +2140,7 @@ __global__ void flash_attention_causal_tile_skipping_regacc_vec4_pcache_kernel(
         }
     }
 }
-
+//还做了__expf，去掉if分支，其他改动均为无效改动
 template<int BLOCK_M, int BLOCK_N, int MAX_D>
 __global__ void flash_attention_causal_tile_skipping_regacc_vec4_pcache_padding_kernel(
     const float* __restrict__ Q,
@@ -2177,6 +2177,7 @@ __global__ void flash_attention_causal_tile_skipping_regacc_vec4_pcache_padding_
     __shared__ float v_smem[BLOCK_N][SMEM_D];
     
     __shared__ float score_smem[BLOCK_M][BLOCK_N];
+    
 
     //用寄存器替代共享内存，省去了acc_smem
     constexpr int THREADS = 128;
@@ -2358,6 +2359,7 @@ __global__ void flash_attention_causal_tile_skipping_regacc_vec4_pcache_padding_
             float tile_max = -FLT_MAX;
 
             if (q < S) {
+                #pragma unroll
                 for (int kj = 0; kj < BLOCK_N; ++kj) {
                     tile_max = fmaxf(tile_max, score_smem[qi][kj]);
                 }
@@ -2365,18 +2367,19 @@ __global__ void flash_attention_causal_tile_skipping_regacc_vec4_pcache_padding_
 
             float m_new = fmaxf(m_old, tile_max);
 
-            float alpha = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
+            float alpha = (m_old == -FLT_MAX) ? 0.0f : __expf(m_old - m_new);
 
             float tile_sum = 0.0f;
 
             if (q < S) {//这一批已经得到最大值，就不需要缩放
+                #pragma unroll
                 for (int kj = 0; kj < BLOCK_N; ++kj) {
                     float s = score_smem[qi][kj];
 
                     //改动expf
                     float p =0.0f;
                     if(s!=-FLT_MAX){
-                        p=expf(s-m_new);
+                        p=__expf(s-m_new);
                     }
                     tile_sum+=p;
                     score_smem[qi][kj]=p;  //覆盖 score_smem，后面它就不是 score，而是 unnormalized prob
@@ -2415,17 +2418,13 @@ __global__ void flash_attention_causal_tile_skipping_regacc_vec4_pcache_padding_
 
                     float alpha = (m_old == -FLT_MAX)
                                     ? 0.0f
-                                    : expf(m_old - m_new);
+                                    : __expf(m_old - m_new);
 
                     float acc = acc_reg[item] * alpha;
-
+                    #pragma unroll
                     for (int kj = 0; kj < BLOCK_N; ++kj) {
-                        float s = score_smem[qi][kj];
-
-                        if (s != 0.0f) {
-                            float p = s;
-                            acc += p * v_smem[kj][d];
-                        }
+                        float p = score_smem[qi][kj];
+                        acc += p * v_smem[kj][d];
                     }
 
                     acc_reg[item] = acc;
