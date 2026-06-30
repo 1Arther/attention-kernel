@@ -853,7 +853,7 @@ void benchmark_decode_case(
 
     std::cout << "Three-stage / fused ratio: "
             << total_ms / fused_ms
-            << "x\n";
+            << "x\n";+
 
     if (config.host_repeat > 0) {
         std::cout << "Host Sync total:     "

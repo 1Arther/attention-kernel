@@ -503,6 +503,28 @@ __global__ void gqa_decode_pv_gemv_kernel(
     out[flat_out_id] = accumulator;
 }
 
+//多线程协作一个token，每 4 个相邻线程组成一个小组，只在这 4 个线程内部做求和，不再让 128 个线程为每一个 token 做一次 block reduction。
+template <int SUBGROUP_SIZE>
+__device__ __forceinline__ float subgroup_reduce_sum(
+    float value
+) {
+    #pragma unroll
+    for (
+        int offset = SUBGROUP_SIZE / 2;
+        offset > 0;
+        offset /= 2
+    ) {
+        value += __shfl_down_sync(
+            0xffffffff,
+            value,
+            offset,
+            SUBGROUP_SIZE
+        );
+    }
+
+    return value;
+}
+
 //online_softmax
 template <int BLOCK_THREADS, int BLOCK_N>
 __global__ void gqa_decode_fused_online_softmax_kernel(
@@ -517,6 +539,12 @@ __global__ void gqa_decode_fused_online_softmax_kernel(
     int D,
     float scale
 ) {
+    static_assert(
+        BLOCK_THREADS ==
+        BLOCK_N * kFusedLanesPerToken,
+        "BLOCK_THREADS 必须等于 BLOCK_N * kFusedLanesPerToken"
+    );
+
     const int global_q_head_idx = blockIdx.x;
     const int total_q_heads = B * QH;
 
@@ -532,16 +560,18 @@ __global__ void gqa_decode_fused_online_softmax_kernel(
 
     const int dim_idx = threadIdx.x;  //D维
 
+    const int tile_token_idx =
+        threadIdx.x / kFusedLanesPerToken;
+
+    const int subgroup_lane_idx =
+        threadIdx.x % kFusedLanesPerToken;
+
     const std::size_t q_offset =
         (static_cast<std::size_t>(batch_idx) * QH + q_head_idx) * D;
 
-    float q_value = 0.0f;  //每个线程维护的寄存器，把自己的Q元素读到寄存器
-
-    if (dim_idx < D) {
-        q_value = q[q_offset + dim_idx];
-    }
-
     float output_acc = 0.0f;  //输出累加器
+
+    __shared__ float q_smem[BLOCK_THREADS];
 
     __shared__ float score_smem[BLOCK_N];  //长度32
 
@@ -552,6 +582,10 @@ __global__ void gqa_decode_fused_online_softmax_kernel(
     __shared__ float online_max;  //当前已处理 token 的最大 score
     __shared__ float online_sum;  //当前已处理 token 的最大 score
     __shared__ float rescale_factor;  //旧状态切换到新最大值时的缩放系数
+
+    if (dim_idx < D) {
+        q_smem[dim_idx] = q[q_offset + dim_idx];
+    }
 
     ////thread0写入，避免重复写
     if (dim_idx == 0) {
@@ -567,45 +601,41 @@ __global__ void gqa_decode_fused_online_softmax_kernel(
         token_block_start < S;
         token_block_start += BLOCK_N
     ) {
-        #pragma unroll
-        for (
-            int tile_token_idx = 0;
-            tile_token_idx < BLOCK_N;
-            ++tile_token_idx
-        ) {
-            const int cache_token_idx =
-                token_block_start + tile_token_idx;
+        const int cache_token_idx =
+            token_block_start + tile_token_idx;
 
-            float local_dot = 0.0f;
+        float local_dot = 0.0f;
 
-            if (dim_idx < D && cache_token_idx < S) {
-                const std::size_t k_offset =
+        if (cache_token_idx < S) {
+            const std::size_t k_offset =
+                (
                     (
-                        (
-                            static_cast<std::size_t>(batch_idx) * S +
-                            cache_token_idx
-                        ) * KVH + kv_head_idx
-                    ) * D;
+                        static_cast<std::size_t>(batch_idx) * S +
+                        cache_token_idx
+                    ) * KVH + kv_head_idx
+                ) * D;
 
-                local_dot =
-                    q_value *
-                    k_cache[k_offset + dim_idx];
+            for (
+                int d = subgroup_lane_idx;
+                d < D;
+                d += kFusedLanesPerToken
+            ) {
+                local_dot +=
+                    q_smem[d] *
+                    k_cache[k_offset + d];
             }
+        }
 
-            //局部乘积求和
-            const float score =
-                block_reduce_sum<BLOCK_THREADS>(
-                    local_dot,
-                    warp_smem
-                );
+        const float score =
+            subgroup_reduce_sum<kFusedLanesPerToken>(
+                local_dot
+            );
 
-            //thread0写入，避免重复写
-            if (dim_idx == 0) {
-                score_smem[tile_token_idx] =
-                    cache_token_idx < S
-                        ? score * scale
-                        : -FLT_MAX;
-            }
+        if (subgroup_lane_idx == 0) {
+            score_smem[tile_token_idx] =
+                cache_token_idx < S
+                    ? score * scale
+                    : -FLT_MAX;
         }
 
         __syncthreads();
@@ -626,6 +656,7 @@ __global__ void gqa_decode_fused_online_softmax_kernel(
         //翻倍
         if (dim_idx == 0) {
             const float previous_max = online_max;
+
             const float next_max =
                 fmaxf(previous_max, tile_max);
 
@@ -642,24 +673,20 @@ __global__ void gqa_decode_fused_online_softmax_kernel(
         //当前tile计算临时概率
         float local_probability_sum = 0.0f;
 
-        for (
-            int tile_token_idx = dim_idx;
-            tile_token_idx < BLOCK_N;
-            tile_token_idx += BLOCK_THREADS
-        ) {
-            const int cache_token_idx =
-                token_block_start + tile_token_idx;
+        if (dim_idx < BLOCK_N) {
+            const int probability_token_idx =
+                token_block_start + dim_idx;
 
             float probability = 0.0f;
 
-            if (cache_token_idx < S) {
+            if (probability_token_idx < S) {
                 probability = __expf(
-                    score_smem[tile_token_idx] - online_max
+                    score_smem[dim_idx] - online_max
                 );
             }
 
-            score_smem[tile_token_idx] = probability;
-            local_probability_sum += probability;
+            score_smem[dim_idx] = probability;
+            local_probability_sum = probability;
         }
 
         //更新分母
@@ -682,24 +709,25 @@ __global__ void gqa_decode_fused_online_softmax_kernel(
 
             #pragma unroll
             for (
-                int tile_token_idx = 0;
-                tile_token_idx < BLOCK_N;
-                ++tile_token_idx
+                int output_tile_token_idx = 0;
+                output_tile_token_idx < BLOCK_N;
+                ++output_tile_token_idx
             ) {
-                const int cache_token_idx =
-                    token_block_start + tile_token_idx;
+                const int output_cache_token_idx =
+                    token_block_start + output_tile_token_idx;
+
                 //更新输出结果
-                if (cache_token_idx < S) {
+                if (output_cache_token_idx < S) {
                     const std::size_t v_offset =
                         (
                             (
                                 static_cast<std::size_t>(batch_idx) * S +
-                                cache_token_idx
+                                output_cache_token_idx
                             ) * KVH + kv_head_idx
                         ) * D;
 
                     output_acc +=
-                        score_smem[tile_token_idx] *
+                        score_smem[output_tile_token_idx] *
                         v_cache[v_offset + dim_idx];
                 }
             }
@@ -707,6 +735,7 @@ __global__ void gqa_decode_fused_online_softmax_kernel(
 
         __syncthreads();
     }
+
     //归一化
     if (dim_idx < D) {
         out[q_offset + dim_idx] =
@@ -715,7 +744,6 @@ __global__ void gqa_decode_fused_online_softmax_kernel(
                 : 0.0f;
     }
 }
-
 // ============================================================
 // Launchers
 // ============================================================
