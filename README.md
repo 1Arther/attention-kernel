@@ -1,230 +1,292 @@
-# CUDA Attention Kernels
+# GQA Decode Attention CUDA Kernel Optimization
 
-基于 C++ / CUDA 实现并优化 Attention 核心算子。当前仓库包含两类实验：
+面向 Decoder 推理阶段的 FP32 GQA Decode Attention CUDA 算子优化项目。
 
-- Prefill Causal Attention / FlashAttention
-- GQA Decode Attention
+项目从最基础的三段式 Attention baseline 出发，逐步实现：
 
-本分支聚焦 **GQA Decode Attention**：从三段式 baseline 出发，完成 online softmax 融合，并将 QK 阶段从“逐 token 全 block 规约”优化为“4-lane subgroup 并行规约”。
+- 三段式 `QK GEMV -> Softmax -> PV GEMV`
+- Fused Online Softmax
+- 4-lane subgroup QK 点积协作
+- Split-KV Partial + Merge
+- Split-KV `split_tokens` 参数扫描与路径推荐
+
+测试平台为 NVIDIA A40，重点研究长 KV Cache 下的 Decode Attention 并行度和中间 workspace 开销。
 
 ---
 
-## 1. 项目结构
+## 1. 项目背景
+
+Decode 阶段通常一次只生成一个 token，因此 Query 的形状为：
 
 ```text
-attention_kernel/
-├── attention_kernel.cu
-├── main.cu
-├── decode_attention.cu
-├── decode_main.cu
-└── README.md
-attention_kernel.cu / main.cu
-    Prefill Causal Attention / FlashAttention 实验
+Q: [B, QH, D]
+```
 
-decode_attention.cu / decode_main.cu
-    GQA Decode Attention：
-    - 三段式 QK GEMV -> Softmax -> PV GEMV baseline
-    - Fused Online Softmax v1
-2. GQA Decode Attention
+历史 Key / Value 存放在 KV Cache 中：
 
-Decode 阶段一次只处理当前生成 token 的 Query：
-
-Q:       [B, QH, D]
+```text
 K cache: [B, S, KVH, D]
 V cache: [B, S, KVH, D]
-
-scores:  [B, QH, S]
-probs:   [B, QH, S]
-Out:     [B, QH, D]
+```
 
 其中：
 
+```text
 B   : batch size
-S   : 当前 KV Cache 长度，即历史 token 数
+S   : KV Cache 中的历史 token 数
 QH  : Query head 数
 KVH : Key / Value head 数
 D   : 每个 head 的维度
+```
 
-GQA 中多个 Query head 共享一组 Key / Value head：
+本项目使用 GQA（Grouped Query Attention）：
 
+```text
 group_size = QH / KVH
-kvh = qh / group_size
+kv_head_idx = q_head_idx / group_size
+```
 
 例如：
 
+```text
 QH = 32
 KVH = 8
 group_size = 4
+```
 
-则：
+则每 4 个 Query head 共享一个 Key / Value head。
 
-Q head 0~3   -> KV head 0
-Q head 4~7   -> KV head 1
-Q head 8~11  -> KV head 2
-...
-Q head 28~31 -> KV head 7
+---
 
-对于固定的 (b, qh)：
+## 2. Attention 计算流程
 
-score[s] =
-dot(Q[b, qh, :], K_cache[b, s, kvh, :]) / sqrt(D)
+对于每个 `(b, qh)`：
+
+```text
+score[s] = dot(Q[b, qh, :], K[b, s, kvh, :]) / sqrt(D)
 
 prob[s] = softmax(score)[s]
 
 Out[b, qh, d] =
-sum_s prob[s] * V_cache[b, s, kvh, d]
-3. 三段式 Baseline
-3.1 QK GEMV
-scores[b, qh, s] =
-dot(Q[b, qh, :], K_cache[b, s, kvh, :]) / sqrt(D)
+    sum_s prob[s] * V[b, s, kvh, d]
+```
 
-线程映射：
+三段式实现对应：
 
-一个线程负责一个 scores[b, qh, s]
-一个线程内部沿 D 维完成点积
-3.2 Softmax
-probs[b, qh, :] =
-softmax(scores[b, qh, :])
+```text
+QK GEMV
+    ↓
+scores [B, QH, S]
+    ↓
+Softmax
+    ↓
+probs [B, QH, S]
+    ↓
+PV GEMV
+    ↓
+Out [B, QH, D]
+```
 
-线程映射：
+---
 
-一个 block 负责一条 score row，即一个 (b, qh)
+## 3. 实现路径
 
-使用 warp shuffle 与 shared memory 完成 block-level max / sum reduction。
+### 3.1 Three-stage Baseline
 
-3.3 PV GEMV
-Out[b, qh, d] =
-sum_s probs[b, qh, s] * V_cache[b, s, kvh, d]
+基础版本拆成三个 kernel：
 
-线程映射：
+```text
+1. QK GEMV
+2. Softmax
+3. PV GEMV
+```
 
-一个线程负责一个 Out[b, qh, d]
-线程沿 S 维扫描并累积
-4. Fused Online Softmax
+优点：
 
-Fused 版本将：
+- 实现清晰
+- 便于逐阶段验证
+- 方便作为性能与正确性 baseline
 
-QK GEMV -> Softmax -> PV GEMV
+不足：
 
-合并成一个 kernel，避免中间张量：
+- 需要额外写入和读取 `scores`
+- 需要额外写入和读取 `probs`
+- 需要三次 kernel launch
+- 长序列时中间 workspace 随 S 线性增长
 
-scores: [B, QH, S]
-probs:  [B, QH, S]
+---
 
-写回和重新读取 global memory。
+### 3.2 Fused Online Softmax
 
-一个 fused block 负责一个 (b, qh)：
+将 QK、Softmax、PV 合并到一个 kernel 中。
 
-grid.x  = B * QH
-block.x = 128
+核心优化：
 
-对于常用测试形状：
+```text
+不再写 scores 到 global memory
+不再写 probs 到 global memory
+一个 kernel 完成 QK + Online Softmax + PV
+```
 
-B=1, QH=32, KVH=8, D=128
+对于每个 `(b, qh)`，一个 CUDA block 扫描完整 KV Cache。
 
-每个 block 对应一个 Query head，并维护该 head 的：
+Online Softmax 维护：
 
-online_max
-online_sum
-output_acc[d]
+```text
+m = 当前处理 token 的最大 score
+l = sum(exp(score - m))
+acc[d] = sum(exp(score - m) * V[d])
+```
 
-在线 softmax 状态更新：
+最终输出：
 
-m_new = max(m_old, tile_max)
-
-alpha = exp(m_old - m_new)
-
-l_new =
-alpha * l_old +
-sum(exp(score_tile - m_new))
-
-acc_new[d] =
-alpha * acc_old[d] +
-sum(exp(score_tile - m_new) * V_tile[:, d])
-
+```text
 Out[d] = acc[d] / l
-5. Fused v0：逐 Token Full-Block Reduction
+```
 
-初版 fused kernel 将 KV Cache 按 BLOCK_N=32 切分。
+短序列下，Fused 版本能明显减少 kernel launch 与中间访存。
 
-但每一个 tile 内的 32 个 token 使用如下方式计算 QK：
+---
 
-token 0  -> 128-thread block reduction
-token 1  -> 128-thread block reduction
-...
-token 31 -> 128-thread block reduction
+### 3.3 4-lane Subgroup QK
 
-即每个 tile 需要 32 次 full-block reduction，导致 token score 计算接近串行化。
+在 Fused 和 Split-KV 的 QK 阶段中，采用 4-lane subgroup 协作计算一个 token 的 QK 点积。
 
-该版本数值正确，但长序列性能较差。
+```text
+128 threads = 32 tokens × 4 threads/token
+```
 
-6. Fused v1：4-Lane Subgroup QK
+对于一个 token：
 
-当前 fused kernel 使用：
-
-BLOCK_THREADS = 128
-BLOCK_N = 32
-LANES_PER_TOKEN = 4
-
-满足：
-
-128 threads = 32 tokens * 4 lanes/token
-
-线程映射：
-
-threads 0~3     -> tile token 0
-threads 4~7     -> tile token 1
-...
-threads 124~127 -> tile token 31
-
-每个 token 的 QK 点积由 4 个线程合作：
-
+```text
 lane 0: d = 0, 4, 8, ...
 lane 1: d = 1, 5, 9, ...
 lane 2: d = 2, 6, 10, ...
 lane 3: d = 3, 7, 11, ...
+```
 
-随后仅在 4-lane subgroup 内做 shuffle reduction。
+每个线程先计算部分 `local_dot`，随后只在 4 个线程内部通过 warp shuffle 求和。
 
-因此一个 tile 中的 32 个 QK score 可以并行生成，而不是逐 token 执行 32 次 full-block reduction。
+相比“一个 token 使用完整 block reduction”，该方式降低了 QK 点积规约开销。
 
-PV 阶段仍采用：
+---
 
-threadIdx.x = d
+### 3.4 Split-KV
 
-即：
+普通 Fused Online Softmax 的 grid 为：
 
-thread 0   -> Out[..., 0]
-thread 1   -> Out[..., 1]
-...
-thread 127 -> Out[..., 127]
-7. Correctness
+```text
+grid.x = B × QH
+```
 
-正确性测试配置：
+在本项目测试配置中：
 
-B=2
-S=17
-QH=4
-KVH=2
-D=32
+```text
+B = 1
+QH = 32
+```
 
-测试结果：
+因此普通 Fused kernel 只有 32 个 CTA。
 
-QK GEMV scores vs CPU passed!
-max_abs_error = 3.725290e-08
+当 `S` 很大时，每个 CTA 都要串行扫描完整 KV Cache，GPU 并行度不足。
 
-Softmax probs vs CPU passed!
-max_abs_error = 1.117587e-08
+Split-KV 沿 S 维切分 KV Cache：
 
-PV GEMV output vs CPU passed!
-max_abs_error = 3.725290e-08
+```text
+grid.x = B × QH × num_splits
+```
 
-Fused online softmax output vs CPU passed!
-max_abs_error = 4.470348e-08
+例如：
 
-三段式 baseline 与 fused v1 均和 CPU reference 对齐，误差保持在 1e-7 以下。
+```text
+S = 8192
+split_tokens = 128
+num_splits = 64
 
-8. Benchmark Environment
+partial CTA 数量：
+1 × 32 × 64 = 2048
+```
+
+每个 partial CTA 只处理一个 `(b, qh, split_idx)`。
+
+Partial kernel 输出：
+
+```text
+partial_max[b, qh, split]
+partial_sum[b, qh, split]
+partial_acc[b, qh, split, d]
+```
+
+其中：
+
+```text
+m_i      = partial_max[i]
+l_i      = partial_sum[i]
+acc_i[d] = partial_acc[i, d]
+```
+
+Merge kernel 使用稳定 softmax 合并：
+
+```text
+M = max_i(m_i)
+
+weight_i = exp(m_i - M)
+
+merged_sum = sum_i(weight_i * l_i)
+
+merged_acc[d] = sum_i(weight_i * acc_i[d])
+
+Out[d] = merged_acc[d] / merged_sum
+```
+
+---
+
+## 4. 编译与运行
+
+### 编译
+
+A40 对应 `sm_86`：
+
+```bash
+nvcc -O3 -std=c++17 -arch=sm_86 \
+  decode_main.cu decode_attention.cu \
+  -o decode_attention_bench
+```
+
+### 正确性测试
+
+```bash
+./decode_attention_bench
+```
+
+测试内容：
+
+```text
+QK GEMV scores vs CPU
+Softmax probs vs CPU
+PV GEMV output vs CPU
+Softmax row-sum
+Fused Online Softmax output vs CPU
+Split-KV output vs CPU
+```
+
+### Benchmark 与 Split-KV 参数扫描
+
+```bash
+./decode_attention_bench --bench
+```
+
+当前扫描候选：
+
+```text
+split_tokens = 128 / 256 / 512 / 1024
+```
+
+---
+
+## 5. Benchmark 设置
+
+```text
 GPU: NVIDIA A40
 Precision: FP32
 
@@ -232,119 +294,288 @@ B   = 1
 QH  = 32
 KVH = 8
 D   = 128
-S   = 1 / 128 / 512 / 2048 / 8192
 
-计时不包含：
+S = 1 / 128 / 256 / 384 / 512 / 768 /
+    1024 / 1536 / 2048 / 4096 / 8192
+```
 
+计时方式：
+
+```text
+CUDA Event:
+只统计 GPU 时间
+
+Host Sync:
+包含 kernel launch、CPU 等待与 GPU 执行时间
+```
+
+以下主表使用 CUDA Event 平均延迟。
+
+不包含：
+
+```text
 cudaMalloc
-Host-to-Device copy
-Device-to-Host copy
-输入生成
-9. Benchmark Results
-9.1 Three-Stage Baseline vs Fused v1
-S	QK GEMV	Softmax	PV GEMV	Three-stage	Fused v1	Three-stage / Fused
-1	7.949 us	2.910 us	2.935 us	12.630 us	5.259 us	2.401x
-128	22.278 us	2.419 us	7.161 us	31.863 us	16.185 us	1.969x
-512	22.357 us	2.738 us	21.065 us	46.202 us	58.255 us	0.793x
-2048	82.629 us	4.481 us	154.776 us	243.067 us	388.403 us	0.626x
-8192	282.332 us	11.494 us	606.945 us	909.896 us	1539.809 us	0.591x
+H2D
+D2H
+随机输入生成
+```
 
-Three-stage / Fused > 1 表示 fused 更快。
+---
 
-9.2 Fused v0 到 Fused v1
-S	Fused v0	Fused v1	v0 / v1
-1	12.950 us	5.259 us	2.46x
-128	65.060 us	16.185 us	4.02x
-512	253.877 us	58.255 us	4.36x
-2048	1447.347 us	388.403 us	3.73x
-8192	5775.191 us	1539.809 us	3.75x
+## 6. Benchmark 结果
 
-4-lane subgroup QK 显著减少了 fused kernel 中 QK score 计算的同步与规约开销。
+### 最优路径
 
-10. Performance Analysis
-短序列
+| S | 最优路径 | 最优 Split Tokens | 最优延迟 | Three-stage 延迟 | 相对 Three-stage |
+|---:|---|---:|---:|---:|---:|
+| 1 | Fused v1 | - | 5.211 us | 12.719 us | 2.44x |
+| 128 | Fused v1 | - | 16.176 us | 31.810 us | 1.97x |
+| 256 | Split-KV | 128 | 23.142 us | 36.541 us | 1.58x |
+| 384 | Split-KV | 128 | 25.331 us | 41.490 us | 1.64x |
+| 512 | Split-KV | 128 | 25.183 us | 46.123 us | 1.83x |
+| 768 | Split-KV | 128 | 34.104 us | 92.116 us | 2.70x |
+| 1024 | Split-KV | 128 | 39.079 us | 124.641 us | 3.19x |
+| 1536 | Split-KV | 128 | 43.721 us | 184.134 us | 4.21x |
+| 2048 | Split-KV | 128 | 48.486 us | 243.075 us | 5.01x |
+| 4096 | Split-KV | 256 | 88.422 us | 460.168 us | 5.20x |
+| 8192 | Split-KV | 128 | 163.953 us | 910.607 us | 5.55x |
 
-S=1 和 S=128 时，fused v1 分别达到：
+### 长上下文重点结果
 
-2.401x
-1.969x
+```text
+GPU: NVIDIA A40
+B=1, QH=32, KVH=8, D=128, S=8192
 
-优势来自：
+Three-stage: 910.607 us
+Fused v1:    1538.831 us
+Split-KV:     163.953 us
+```
 
-三次 kernel launch -> 一次 kernel launch
-不写 scores workspace
-不读 scores workspace
-不写 probs workspace
-不读 probs workspace
-Q 向量在 block 内复用
-长序列
+对应加速比：
 
-S=512 之后，fused v1 开始落后于三段式 baseline。
+```text
+Split-KV vs Three-stage: 5.55x
+Split-KV vs Fused v1:    9.39x
+```
 
-根因不再是逐 token full-block reduction，而是：
+---
 
-fused grid.x = B * QH = 32 blocks
+## 7. 性能分析
 
-每个 block 需要串行扫描完整 KV Cache。
+### 短序列
 
-当：
+在 `S=1` 和 `S=128` 下，Fused v1 最优。
 
-S = 8192
-BLOCK_N = 32
+原因：
 
-每个 block 需要处理：
+```text
+减少两次 kernel launch
+消除 scores / probs 的 global memory 中间读写
+```
 
-8192 / 32 = 256 个 tile
+### 中长序列
 
-而三段式 QK kernel 的 block 数会随 S 增长，能提供更高的 GPU 并行度。
+普通 Fused v1 在长序列下变慢。
 
-因此，fused v1 的结论是：
+原因：
 
-短序列：融合明显有效
-长序列：需要进一步提升 CTA 数量
-11. Next Step
+```text
+grid.x = B × QH = 32
+```
 
-下一步实现 Split-KV Decode Attention：
+CTA 数量过少，无法充分利用 A40 的并行能力；每个 CTA 还需要串行扫描完整 S。
 
-Split-KV partial kernel
--> 生成 partial_max / partial_sum / partial_acc
--> merge kernel 合并各 split 的 online-softmax 状态
--> 输出最终 Out
+### Split-KV
 
-对于：
+Split-KV 将 S 维切成多个 split：
 
-B=1, QH=32, S=8192, split_size=512
+```text
+grid.x = B × QH × num_splits
+```
 
-可将 block 数从：
+通过增加 partial CTA 数量获得更高并行度。
 
-B * QH = 32
+例如 `S=8192, split_tokens=128`：
 
-提升到：
+```text
+num_splits = 64
+partial CTA = 1 × 32 × 64 = 2048
+```
 
-B * QH * ceil(S / split_size)
-= 1 * 32 * 16
-= 512
+因此 Split-KV 在长上下文下显著优于单 CTA Fused。
 
-目标是解决长 KV Cache 下 fused kernel 的并行度不足问题。
+---
 
-12. Build and Run
+## 8. Workspace 对比
 
-编译：
+三段式 baseline 需要：
 
-nvcc -O3 -std=c++17 -arch=sm_86 \
-  decode_main.cu decode_attention.cu \
-  -o decode_attention_bench
+```text
+scores + probs
+```
 
-正确性测试：
+当 `S=8192`：
 
-./decode_attention_bench
+```text
+Three-stage workspace: 2.000 MiB
+```
 
-Benchmark：
+Split-KV workspace 随 split 数增加：
 
-./decode_attention_bench --bench
+| S=8192 配置 | Split-KV Workspace | CUDA Event |
+|---|---:|---:|
+| split_tokens=128 | 1.016 MiB | 163.953 us |
+| split_tokens=256 | 0.508 MiB | 189.875 us |
+| split_tokens=512 | 0.254 MiB | 167.757 us |
+| split_tokens=1024 | 0.127 MiB | 270.259 us |
 
-查看寄存器和 shared memory 使用：
+结论：
 
-nvcc -O3 -std=c++17 -arch=sm_86 -Xptxas -v \
-  decode_main.cu decode_attention.cu \
-  -o decode_attention_bench
+```text
+split_tokens=128：
+最低延迟优先
+
+split_tokens=512：
+延迟接近最低，但 workspace 更低
+```
+
+因此 Split-KV 不只是单纯追求速度，也存在延迟与 workspace 的工程权衡。
+
+---
+
+## 9. 当前实验性 Dispatch 建议
+
+针对当前测试环境：
+
+```text
+GPU: A40
+FP32
+B=1, QH=32, KVH=8, D=128
+```
+
+可以采用：
+
+```cpp
+if (S <= 128) {
+    use_fused_online_softmax();
+} else if (S <= 2048) {
+    use_split_kv(128);
+} else if (S <= 4096) {
+    use_split_kv(256);
+} else {
+    use_split_kv(128);
+}
+```
+
+注意：
+
+```text
+该表仅基于当前 A40、当前 shape 与当前实现测试得到。
+不同 GPU、batch size、head 数、head dimension 下需要重新 benchmark。
+```
+
+当前代码实现的是 benchmark 侧的 candidate scan 与推荐输出，尚未把该 dispatch 逻辑封装为实际 runtime API。
+
+---
+
+## 10. 正确性验证
+
+所有测试 shape 均通过 CPU reference 对齐。
+
+典型误差：
+
+```text
+max_abs_error ≈ 1e-8 ~ 1e-7
+```
+
+不同实现的浮点累加顺序不同，因此不要求 bitwise 完全一致。
+
+---
+
+## 11. 项目结构
+
+```text
+attention_kernel/
+├── decode_attention.cu
+│   ├── CPU reference
+│   ├── QK GEMV kernel
+│   ├── Softmax kernel
+│   ├── PV GEMV kernel
+│   ├── Fused Online Softmax kernel
+│   ├── Split-KV Partial kernel
+│   ├── Split-KV Merge kernel
+│   └── kernel launchers
+│
+├── decode_main.cu
+│   ├── correctness test
+│   ├── CUDA Event benchmark
+│   ├── Host Sync benchmark
+│   ├── Split-KV candidate scan
+│   └── path recommendation
+│
+└── README.md
+```
+
+---
+
+## 12. 当前限制
+
+当前实现是面向学习和算子优化验证的 FP32 GQA Decode Attention kernel，不是生产级推理引擎实现。
+
+限制包括：
+
+```text
+FP32 only
+D <= 128
+固定 128-thread block 配置
+连续 KV Cache layout
+不支持 PagedAttention
+未使用 FP16 / BF16 / Tensor Core
+未使用 vectorized load
+未接入 vLLM / TensorRT-LLM / SGLang
+未实现真实 runtime dispatch
+```
+
+---
+
+## 13. 后续可扩展方向
+
+```text
+1. 支持 FP16 / BF16
+2. 支持 half2 / vectorized load
+3. 支持更多 D，例如 64 / 80 / 96 / 128 / 256
+4. 为不同 D、S、QH、KVH 建立更完整的 dispatch table
+5. 支持 PagedAttention KV Cache
+6. 对比 FlashDecoding 类方案
+7. 引入 Nsight Compute 分析 occupancy、memory throughput、warp stall
+8. 集成到简化推理引擎或 PyTorch extension
+```
+
+---
+
+## 14. 项目总结
+
+本项目完成了从 baseline 到并行度优化的完整 CUDA 算子优化闭环：
+
+```text
+Three-stage baseline
+    ↓
+Fused Online Softmax
+    ↓
+4-lane subgroup QK
+    ↓
+Split-KV Partial + Merge
+    ↓
+split_tokens candidate scan
+    ↓
+长上下文下获得显著加速
+```
+
+在 NVIDIA A40、FP32、`B=1,QH=32,KVH=8,D=128,S=8192` 下：
+
+```text
+Split-KV: 163.953 us
+Three-stage: 910.607 us
+
+Speedup: 5.55x
+```

@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include <limits>
+
 void decode_attention_gqa_cpu(
     const float* q,
     const float* k_cache,
@@ -81,6 +83,27 @@ void launch_decode_attention_fused_online_softmax(
     int D
 );
 
+int get_decode_attention_split_kv_num_splits(
+    int S,
+    int split_tokens
+);
+
+void launch_decode_attention_split_kv(
+    const float* d_q,
+    const float* d_k_cache,
+    const float* d_v_cache,
+    float* d_partial_max,
+    float* d_partial_sum,
+    float* d_partial_acc,
+    float* d_out,
+    int B,
+    int S,
+    int QH,
+    int KVH,
+    int D,
+    int split_tokens
+);
+
 #define CUDA_CHECK(call)                                                   \
     do {                                                                   \
         const cudaError_t status = (call);                                 \
@@ -94,7 +117,18 @@ void launch_decode_attention_fused_online_softmax(
     } while (false)
 
 namespace {
+    // 默认用于普通正确性测试。
+constexpr int kDefaultSplitTokens = 512;
 
+// 用于 Split-KV auto-tuning 的候选参数。
+// benchmark 时会逐个测试。
+constexpr int kSplitTokenCandidates[] = {
+    128,
+    256,
+    512,
+    1024
+};
+}
 template <typename T>
 class DeviceBuffer {
 public:
@@ -524,6 +558,75 @@ bool test_gqa_decode_attention() {
         out_cpu
     );
 
+        // --------------------------------------------------------
+    // Split-KV 正确性测试。
+    //
+    // 普通 correctness test 固定用 split_tokens=512。
+    // benchmark 阶段会再扫描多个 split_tokens。
+    // --------------------------------------------------------
+
+    constexpr int split_tokens =
+        kDefaultSplitTokens;
+
+    const int split_num =
+        get_decode_attention_split_kv_num_splits(
+            S,
+            split_tokens
+        );
+
+    const std::size_t partial_elements =
+        static_cast<std::size_t>(B) *
+        QH *
+        split_num;
+
+    const std::size_t partial_acc_elements =
+        partial_elements * D;
+
+    DeviceBuffer<float> d_partial_max(
+        partial_elements
+    );
+
+    DeviceBuffer<float> d_partial_sum(
+        partial_elements
+    );
+
+    DeviceBuffer<float> d_partial_acc(
+        partial_acc_elements
+    );
+
+    launch_decode_attention_split_kv(
+        d_q.get(),
+        d_k_cache.get(),
+        d_v_cache.get(),
+        d_partial_max.get(),
+        d_partial_sum.get(),
+        d_partial_acc.get(),
+        d_out.get(),
+        B,
+        S,
+        QH,
+        KVH,
+        D,
+        split_tokens
+    );
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> split_kv_out_gpu(q_elements);
+
+    CUDA_CHECK(cudaMemcpy(
+        split_kv_out_gpu.data(),
+        d_out.get(),
+        split_kv_out_gpu.size() * sizeof(float),
+        cudaMemcpyDeviceToHost
+    ));
+
+    all_ok &= check_tensor_close(
+        "Split-KV output vs CPU",
+        split_kv_out_gpu,
+        out_cpu
+    );
+
     return all_ok;
 }
 
@@ -543,6 +646,10 @@ void benchmark_decode_case(
 ) {
     constexpr int kWarmup = 10;
 
+    // --------------------------------------------------------
+    // 计算各张量的元素数量。
+    // --------------------------------------------------------
+
     const std::size_t q_elements =
         static_cast<std::size_t>(config.B) *
         config.QH *
@@ -558,6 +665,44 @@ void benchmark_decode_case(
         static_cast<std::size_t>(config.B) *
         config.QH *
         config.S;
+
+    // --------------------------------------------------------
+    // 为当前 S 生成真正有效的 split candidate。
+    //
+    // 例如：
+    // S=128 时：
+    // 原候选 [128,256,512,1024]
+    // 实际只保留 [128]
+    //
+    // S=512 时：
+    // 实际保留 [128,256,512]
+    //
+    // 避免多个候选都退化为同一个 num_splits=1。
+    // --------------------------------------------------------
+
+    std::vector<int> split_token_candidates;
+
+    for (const int candidate : kSplitTokenCandidates) {
+        const int effective_split_tokens =
+            std::min(candidate, config.S);
+
+        const bool already_exists =
+            std::find(
+                split_token_candidates.begin(),
+                split_token_candidates.end(),
+                effective_split_tokens
+            ) != split_token_candidates.end();
+
+        if (!already_exists) {
+            split_token_candidates.push_back(
+                effective_split_tokens
+            );
+        }
+    }
+
+    // --------------------------------------------------------
+    // 构造确定性随机输入。
+    // --------------------------------------------------------
 
     const std::vector<float> q =
         make_random_vector(
@@ -577,6 +722,10 @@ void benchmark_decode_case(
             3000U + static_cast<unsigned int>(config.S)
         );
 
+    // --------------------------------------------------------
+    // CPU reference。
+    // --------------------------------------------------------
+
     std::vector<float> scores_cpu(score_elements);
     std::vector<float> probs_cpu(score_elements);
     std::vector<float> out_cpu(q_elements);
@@ -594,6 +743,10 @@ void benchmark_decode_case(
         config.KVH,
         config.D
     );
+
+    // --------------------------------------------------------
+    // GPU 输入 / 输出 buffer。
+    // --------------------------------------------------------
 
     DeviceBuffer<float> d_q(q_elements);
     DeviceBuffer<float> d_k_cache(kv_elements);
@@ -623,6 +776,16 @@ void benchmark_decode_case(
         cudaMemcpyHostToDevice
     ));
 
+    const std::string check_name =
+        std::string("Benchmark correctness: ") +
+        config.name;
+
+    std::vector<float> out_gpu(q_elements);
+
+    // --------------------------------------------------------
+    // 三段式 baseline 正确性。
+    // --------------------------------------------------------
+
     launch_decode_attention_three_stage(
         d_q.get(),
         d_k_cache.get(),
@@ -639,8 +802,6 @@ void benchmark_decode_case(
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    std::vector<float> out_gpu(q_elements);
-
     CUDA_CHECK(cudaMemcpy(
         out_gpu.data(),
         d_out.get(),
@@ -648,18 +809,19 @@ void benchmark_decode_case(
         cudaMemcpyDeviceToHost
     ));
 
-    const std::string check_name =
-        std::string("Benchmark correctness: ") + config.name;
-
     if (!check_tensor_close(
-            check_name + " output",
+            check_name + " three-stage output",
             out_gpu,
             out_cpu
         )) {
         throw std::runtime_error(
-            "Benchmark correctness check failed"
+            "Three-stage benchmark correctness check failed"
         );
     }
+
+    // --------------------------------------------------------
+    // Fused Online Softmax v1 正确性。
+    // --------------------------------------------------------
 
     launch_decode_attention_fused_online_softmax(
         d_q.get(),
@@ -683,14 +845,18 @@ void benchmark_decode_case(
     ));
 
     if (!check_tensor_close(
-            check_name + " fused online softmax output",
+            check_name + " fused v1 output",
             out_gpu,
             out_cpu
         )) {
         throw std::runtime_error(
-            "Fused benchmark correctness check failed"
+            "Fused v1 benchmark correctness check failed"
         );
     }
+
+    // --------------------------------------------------------
+    // 封装 baseline / fused 的 launch。
+    // --------------------------------------------------------
 
     const auto launch_qk = [&]() {
         decode_qk_gemv_launcher(
@@ -728,7 +894,7 @@ void benchmark_decode_case(
         );
     };
 
-    const auto launch_total = [&]() {
+    const auto launch_three_stage = [&]() {
         launch_decode_attention_three_stage(
             d_q.get(),
             d_k_cache.get(),
@@ -744,7 +910,7 @@ void benchmark_decode_case(
         );
     };
 
-    const auto launch_fused_online_softmax = [&]() {
+    const auto launch_fused_v1 = [&]() {
         launch_decode_attention_fused_online_softmax(
             d_q.get(),
             d_k_cache.get(),
@@ -757,6 +923,10 @@ void benchmark_decode_case(
             config.D
         );
     };
+
+    // --------------------------------------------------------
+    // baseline / fused CUDA Event 计时。
+    // --------------------------------------------------------
 
     const float qk_ms = benchmark_cuda_event(
         launch_qk,
@@ -776,41 +946,53 @@ void benchmark_decode_case(
         config.event_repeat
     );
 
-    const float total_ms = benchmark_cuda_event(
-        launch_total,
-        kWarmup,
-        config.event_repeat
-    );
+    const float three_stage_ms =
+        benchmark_cuda_event(
+            launch_three_stage,
+            kWarmup,
+            config.event_repeat
+        );
 
-    const float fused_ms = benchmark_cuda_event(
-        launch_fused_online_softmax,
-        kWarmup,
-        config.event_repeat
-    );
+    const float fused_v1_ms =
+        benchmark_cuda_event(
+            launch_fused_v1,
+            kWarmup,
+            config.event_repeat
+        );
 
-    float host_sync_ms = 0.0f;
-    float fused_host_sync_ms = 0.0f;
+    float three_stage_host_sync_ms = 0.0f;
+    float fused_v1_host_sync_ms = 0.0f;
 
     if (config.host_repeat > 0) {
-        host_sync_ms = benchmark_host_sync(
-            launch_total,
-            kWarmup,
-            config.host_repeat
-        );
-        fused_host_sync_ms = benchmark_host_sync(
-            launch_fused_online_softmax,
-            kWarmup,
-            config.host_repeat
-        );
+        three_stage_host_sync_ms =
+            benchmark_host_sync(
+                launch_three_stage,
+                kWarmup,
+                config.host_repeat
+            );
+
+        fused_v1_host_sync_ms =
+            benchmark_host_sync(
+                launch_fused_v1,
+                kWarmup,
+                config.host_repeat
+            );
     }
 
-    const double workspace_mb =
+    // 三段式 workspace：
+    // scores + probs。
+    const double three_stage_workspace_mb =
         static_cast<double>(
-            (score_elements + score_elements) * sizeof(float)
+            2 * score_elements * sizeof(float)
         ) /
         (1024.0 * 1024.0);
 
+    // --------------------------------------------------------
+    // 输出当前 shape 的 baseline / fused 结果。
+    // --------------------------------------------------------
+
     std::cout << "\n---- " << config.name << " ----\n";
+
     std::cout << "shape: B=" << config.B
               << ", S=" << config.S
               << ", QH=" << config.QH
@@ -824,7 +1006,7 @@ void benchmark_decode_case(
 
     std::cout << "scores + probs workspace: "
               << std::fixed << std::setprecision(3)
-              << workspace_mb
+              << three_stage_workspace_mb
               << " MiB\n";
 
     std::cout << "CUDA Event QK GEMV:  "
@@ -843,35 +1025,265 @@ void benchmark_decode_case(
               << (qk_ms + softmax_ms + pv_ms) * 1000.0f
               << " us\n";
 
-    std::cout << "CUDA Event total:    "
-              << total_ms * 1000.0f
+    std::cout << "CUDA Event three-stage: "
+              << three_stage_ms * 1000.0f
               << " us\n";
 
-    std::cout << "CUDA Event fused online softmax: "
-          << fused_ms * 1000.0f
-          << " us\n";
+    std::cout << "CUDA Event fused v1:    "
+              << fused_v1_ms * 1000.0f
+              << " us\n";
 
-    std::cout << "Three-stage / fused ratio: "
-            << total_ms / fused_ms
-            << "x\n";+
+    std::cout << "Three-stage / fused v1: "
+              << three_stage_ms / fused_v1_ms
+              << "x\n";
 
     if (config.host_repeat > 0) {
-        std::cout << "Host Sync total:     "
-                  << host_sync_ms * 1000.0f
+        std::cout << "Host Sync three-stage: "
+                  << three_stage_host_sync_ms * 1000.0f
+                  << " us\n";
+
+        std::cout << "Host Sync fused v1:    "
+                  << fused_v1_host_sync_ms * 1000.0f
                   << " us\n";
     }
 
-    std::cout << "Host Sync fused online softmax: "
-          << fused_host_sync_ms * 1000.0f
-          << " us\n";
+    // --------------------------------------------------------
+    // Split-KV auto-tuning。
+    //
+    // 对每个 split_tokens：
+    //
+    // 1. 分配对应 workspace。
+    // 2. 做 CPU reference 正确性验证。
+    // 3. CUDA Event benchmark。
+    // 4. Host Sync benchmark。
+    // 5. 记录最快候选。
+    // --------------------------------------------------------
+
+    float best_split_kv_ms =
+        std::numeric_limits<float>::infinity();
+
+    float best_split_kv_host_sync_ms = 0.0f;
+
+    int best_split_tokens = 0;
+    int best_num_splits = 0;
+
+    std::cout << "Split-KV candidate scan:\n";
+
+    for (const int split_tokens : split_token_candidates) {
+        const int num_splits =
+            get_decode_attention_split_kv_num_splits(
+                config.S,
+                split_tokens
+            );
+
+        // partial_max / partial_sum:
+        // [B, QH, num_splits]
+        const std::size_t partial_elements =
+            static_cast<std::size_t>(config.B) *
+            config.QH *
+            num_splits;
+
+        // partial_acc:
+        // [B, QH, num_splits, D]
+        const std::size_t partial_acc_elements =
+            partial_elements *
+            config.D;
+
+        DeviceBuffer<float> d_partial_max(
+            partial_elements
+        );
+
+        DeviceBuffer<float> d_partial_sum(
+            partial_elements
+        );
+
+        DeviceBuffer<float> d_partial_acc(
+            partial_acc_elements
+        );
+
+        const auto launch_split_kv = [&]() {
+            launch_decode_attention_split_kv(
+                d_q.get(),
+                d_k_cache.get(),
+                d_v_cache.get(),
+                d_partial_max.get(),
+                d_partial_sum.get(),
+                d_partial_acc.get(),
+                d_out.get(),
+                config.B,
+                config.S,
+                config.QH,
+                config.KVH,
+                config.D,
+                split_tokens
+            );
+        };
+
+        // ----------------------------------------------------
+        // 当前 split_tokens 的正确性。
+        // ----------------------------------------------------
+
+        launch_split_kv();
+
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaMemcpy(
+            out_gpu.data(),
+            d_out.get(),
+            out_gpu.size() * sizeof(float),
+            cudaMemcpyDeviceToHost
+        ));
+
+        if (!check_tensor_close(
+                check_name +
+                " Split-KV split=" +
+                std::to_string(split_tokens),
+                out_gpu,
+                out_cpu
+            )) {
+            throw std::runtime_error(
+                "Split-KV benchmark correctness check failed"
+            );
+        }
+
+        // ----------------------------------------------------
+        // 当前 split_tokens 的性能。
+        // ----------------------------------------------------
+
+        const float split_kv_ms =
+            benchmark_cuda_event(
+                launch_split_kv,
+                kWarmup,
+                config.event_repeat
+            );
+
+        float split_kv_host_sync_ms = 0.0f;
+
+        if (config.host_repeat > 0) {
+            split_kv_host_sync_ms =
+                benchmark_host_sync(
+                    launch_split_kv,
+                    kWarmup,
+                    config.host_repeat
+                );
+        }
+
+        const double split_workspace_mb =
+            static_cast<double>(
+                (
+                    partial_elements +
+                    partial_elements +
+                    partial_acc_elements
+                ) * sizeof(float)
+            ) /
+            (1024.0 * 1024.0);
+
+        std::cout
+            << "  split_tokens="
+            << std::setw(4)
+            << split_tokens
+            << ", num_splits="
+            << std::setw(2)
+            << num_splits
+            << ", workspace="
+            << std::fixed << std::setprecision(3)
+            << split_workspace_mb
+            << " MiB"
+            << ", CUDA Event="
+            << split_kv_ms * 1000.0f
+            << " us"
+            << ", Three-stage / Split-KV="
+            << three_stage_ms / split_kv_ms
+            << "x"
+            << ", Fused v1 / Split-KV="
+            << fused_v1_ms / split_kv_ms
+            << "x";
+
+        if (config.host_repeat > 0) {
+            std::cout
+                << ", Host Sync="
+                << split_kv_host_sync_ms * 1000.0f
+                << " us";
+        }
+
+        std::cout << "\n";
+
+        if (split_kv_ms < best_split_kv_ms) {
+            best_split_kv_ms = split_kv_ms;
+            best_split_kv_host_sync_ms =
+                split_kv_host_sync_ms;
+
+            best_split_tokens = split_tokens;
+            best_num_splits = num_splits;
+        }
+    }
+
+    std::cout
+        << "Best Split-KV candidate: "
+        << "split_tokens="
+        << best_split_tokens
+        << ", num_splits="
+        << best_num_splits
+        << ", CUDA Event="
+        << best_split_kv_ms * 1000.0f
+        << " us"
+        << ", Three-stage / best Split-KV="
+        << three_stage_ms / best_split_kv_ms
+        << "x"
+        << ", Fused v1 / best Split-KV="
+        << fused_v1_ms / best_split_kv_ms
+        << "x";
+
+    if (config.host_repeat > 0) {
+        std::cout
+            << ", Host Sync="
+            << best_split_kv_host_sync_ms * 1000.0f
+            << " us";
+    }
+
+    std::cout << "\n";
+
+    // --------------------------------------------------------
+    // 给当前 shape 输出最快路径。
+    // --------------------------------------------------------
+
+    if (
+        fused_v1_ms <= three_stage_ms &&
+        fused_v1_ms <= best_split_kv_ms
+    ) {
+        std::cout
+            << "Recommended path: Fused v1\n";
+    } else if (
+        three_stage_ms <= fused_v1_ms &&
+        three_stage_ms <= best_split_kv_ms
+    ) {
+        std::cout
+            << "Recommended path: Three-stage\n";
+    } else {
+        std::cout
+            << "Recommended path: Split-KV"
+            << " (split_tokens="
+            << best_split_tokens
+            << ")\n";
+    }
 }
 
 void run_benchmarks() {
     std::cout << "\n========================================\n";
-    std::cout << "GQA Decode Attention Three-Stage Benchmark\n";
+    std::cout << "GQA Decode Attention Auto-Tuning Benchmark\n";
     std::cout << "========================================\n";
-    std::cout << "Pipeline: QK GEMV -> Softmax -> PV GEMV\n";
-    std::cout << "Not included: cudaMalloc, H2D, D2H, input generation\n";
+
+    std::cout
+        << "Implementations: "
+        << "Three-stage / Fused v1 / Split-KV\n";
+
+    std::cout
+        << "Split-KV candidates: "
+        << "128 / 256 / 512 / 1024\n";
+
+    std::cout
+        << "Not included: "
+        << "cudaMalloc, H2D, D2H, input generation\n";
 
     const BenchmarkConfig configs[] = {
         {
@@ -885,14 +1297,44 @@ void run_benchmarks() {
             10000, 3000
         },
         {
+            "Decode S=256",
+            1, 256, 32, 8, 128,
+            6000, 2000
+        },
+        {
+            "Decode S=384",
+            1, 384, 32, 8, 128,
+            4000, 1500
+        },
+        {
             "Decode S=512",
             1, 512, 32, 8, 128,
             3000, 1000
         },
         {
+            "Decode S=768",
+            1, 768, 32, 8, 128,
+            2000, 800
+        },
+        {
+            "Decode S=1024",
+            1, 1024, 32, 8, 128,
+            1500, 600
+        },
+        {
+            "Decode S=1536",
+            1, 1536, 32, 8, 128,
+            1000, 400
+        },
+        {
             "Decode S=2048",
             1, 2048, 32, 8, 128,
             800, 300
+        },
+        {
+            "Decode S=4096",
+            1, 4096, 32, 8, 128,
+            400, 150
         },
         {
             "Decode S=8192",
@@ -905,8 +1347,6 @@ void run_benchmarks() {
         benchmark_decode_case(config);
     }
 }
-
-}  // namespace
 
 int main(int argc, char** argv) {
     try {
